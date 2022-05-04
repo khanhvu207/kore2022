@@ -1,6 +1,8 @@
 import os
 import json
 import copy
+import fire
+import datetime
 import numpy as np
 import pandas as pd
 
@@ -10,7 +12,9 @@ from collections import defaultdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import pytorch_lightning as pl
 from torch.utils.data import Dataset, DataLoader
+from transformers import get_cosine_schedule_with_warmup
 
 from kformer.supervised.utils import Timer, profile
 from kformer.supervised.utils import fleet_w2i, shipyard_w2i, fleet_dir
@@ -138,9 +142,8 @@ class SpatialEncoder(nn.Module):
 
 
 class KoreNet(nn.Module):
-    def __init__(self, input_ch, batch_size, device):
+    def __init__(self, input_ch, batch_size):
         super().__init__()
-        self.device = device
         self.batch_size = batch_size
 
         self.scalar_encoder = nn.Sequential(
@@ -163,7 +166,7 @@ class KoreNet(nn.Module):
         self.pos_emb_y = nn.Embedding(22, 144, padding_idx=21)
         self.domain_emb = nn.Embedding(5, 288, padding_idx=0) # SEP token is 0.
         self.seq_pos_emb = nn.Embedding(1000, 288)
-        self.sep_token = nn.Parameter(torch.zeros(1, 288)).to(self.device)
+        self.sep_token = nn.Parameter(torch.zeros(1, 288)).cuda()
         self.tgt_len = 20
         self.tgt_pos_emb = nn.Embedding(20, 288)
         self.team_emb = nn.Embedding(10, 288)
@@ -178,34 +181,48 @@ class KoreNet(nn.Module):
         self.fc = nn.Linear(288, 23)
     
     def prepare_input_seq(self, x):
-        global_info = x["global_info"].to(self.device)
+        global_info = x["global_info"].cuda()
         scalar_token = self.scalar_encoder(global_info).unsqueeze(1) # shape (bs, 1, 288)
         
-        fmap = x["fmap"].to(self.device)
+        fmap = x["fmap"].cuda()
+        # print("count nans", torch.isnan(fmap).sum())
+        # print("fmap", fmap)
+
         fmap = self.spatial_encoder(fmap)
         vis_tokens = fmap.view(fmap.shape[0], fmap.shape[1], -1).permute(0, 2, 1)
+        # print("after conv", vis_tokens)
+
         vis_tokens = self.up_projection(vis_tokens) # shape (bs, 441, 288)
+        # print("after up projection", vis_tokens)
+
         map_pos_x_embs = torch.tensor(np.arange(21)).unsqueeze(1).repeat(1, 21).view(1, -1).expand(fmap.shape[0], 21 * 21).long()
-        map_pos_x_embs = self.pos_emb_x(map_pos_x_embs.to(self.device))
-        map_pos_y_embs = torch.tensor([np.arange(21)]).repeat(fmap.shape[0], 21).long()
-        map_pos_y_embs = self.pos_emb_y(map_pos_y_embs.to(self.device))
+        map_pos_x_embs = self.pos_emb_x(map_pos_x_embs.cuda())
+        map_pos_y_embs = torch.tensor(np.arange(21)).unsqueeze(0).repeat(fmap.shape[0], 21).long()
+        map_pos_y_embs = self.pos_emb_y(map_pos_y_embs.cuda())
         map_pos_embs = torch.cat([map_pos_x_embs, map_pos_y_embs], dim=2)
         vis_tokens += map_pos_embs
         
-        team_fleet_tokens = x["team_fleet_emb"].to(self.device) # shape (bs, n_fleet, 288)
-        team_pos_x_embs = self.pos_emb_x(x["team_fleet_pos_x"].to(self.device))
-        team_pos_y_embs = self.pos_emb_y(x["team_fleet_pos_y"].to(self.device))
+        team_fleet_tokens = x["team_fleet_emb"].cuda() # shape (bs, n_fleet, 288)
+        team_pos_x_embs = self.pos_emb_x(x["team_fleet_pos_x"].cuda())
+        team_pos_y_embs = self.pos_emb_y(x["team_fleet_pos_y"].cuda())
         team_pos_embs = torch.cat([team_pos_x_embs, team_pos_y_embs], dim=2)
         team_fleet_tokens += team_pos_embs
         
-        opp_fleet_tokens = x["opp_fleet_emb"].to(self.device) # shape (bs, n_fleet, 288)
-        opp_pos_x_embs = self.pos_emb_x(x["opp_fleet_pos_x"].to(self.device))
-        opp_pos_y_embs = self.pos_emb_y(x["opp_fleet_pos_y"].to(self.device))
+        opp_fleet_tokens = x["opp_fleet_emb"].cuda() # shape (bs, n_fleet, 288)
+        opp_pos_x_embs = self.pos_emb_x(x["opp_fleet_pos_x"].cuda())
+        opp_pos_y_embs = self.pos_emb_y(x["opp_fleet_pos_y"].cuda())
         opp_pos_embs = torch.cat([opp_pos_x_embs, opp_pos_y_embs], dim=2)
         opp_fleet_tokens += opp_pos_embs
         
         # Full sequence
         sep_token = self.sep_token.unsqueeze(0).expand(fmap.shape[0], 1, -1) # shape (bs, 1, 288)
+
+        # print("scalar", scalar_token)
+        # print("vis", vis_tokens)
+        # print("sep", sep_token)
+        # print("team_fleet", team_fleet_tokens)
+        # print("opp_fleet", opp_fleet_tokens)
+
         seq = torch.cat([scalar_token, vis_tokens, sep_token, team_fleet_tokens, sep_token, opp_fleet_tokens], dim=1)
         # seq = global_info + spatial_tokens + [SEP] + team_fleet_tokens + [SEP] + opp_fleet_tokens
         
@@ -216,35 +233,35 @@ class KoreNet(nn.Module):
         # SEP token = 0
         domain_tokens = [1] + [2] * vis_tokens.shape[1] + [0] + [3] * team_fleet_tokens.shape[1] + [0] + [3] * opp_fleet_tokens.shape[1]
         domain_tokens = torch.tensor(domain_tokens).long().unsqueeze(0).expand(self.batch_size, -1)
-        domain_embs = self.domain_emb(domain_tokens.to(self.device))
+        domain_embs = self.domain_emb(domain_tokens.cuda())
         seq += domain_embs
         
         seq_pos_embs = torch.arange(seq.shape[1]).unsqueeze(0).expand(seq.shape[0], -1)
-        seq_pos_embs = self.seq_pos_emb(seq_pos_embs.to(self.device))
+        seq_pos_embs = self.seq_pos_emb(seq_pos_embs.cuda())
         seq += seq_pos_embs
         
         # Sequence mask
-        team_fleet_mask = x["team_fleet_mask"].to(self.device)
-        opp_fleet_mask = x["opp_fleet_mask"].to(self.device)
-        global_info_mask = torch.tensor([True]).expand(seq.shape[0]).bool().unsqueeze(1).to(self.device)
-        sep_mask = torch.tensor([False]).expand(seq.shape[0]).bool().unsqueeze(1).to(self.device)
-        spatial_mask = torch.tensor(True).expand(seq.shape[0], 21 * 21).to(self.device)
+        team_fleet_mask = x["team_fleet_mask"].cuda()
+        opp_fleet_mask = x["opp_fleet_mask"].cuda()
+        global_info_mask = torch.tensor([True]).expand(seq.shape[0]).bool().unsqueeze(1).cuda()
+        sep_mask = torch.tensor([False]).expand(seq.shape[0]).bool().unsqueeze(1).cuda()
+        spatial_mask = torch.tensor(True).expand(seq.shape[0], 21 * 21).cuda()
         seq_mask = torch.cat([global_info_mask, spatial_mask, sep_mask, team_fleet_mask, sep_mask, opp_fleet_mask], dim=1)
         
         return seq, seq_mask
     
     def prepare_target_seq(self, x):
-        pos_embs = torch.arange(self.tgt_len).long().to(self.device)
+        pos_embs = torch.arange(self.tgt_len).long().cuda()
         pos_embs = self.tgt_pos_emb(pos_embs).unsqueeze(0).expand(self.batch_size, -1, -1)
-        ship_pos_x = x["ship_pos_x"].to(self.device).unsqueeze(1)
-        ship_pos_y = x["ship_pos_y"].to(self.device).unsqueeze(1)
+        ship_pos_x = x["ship_pos_x"].cuda().unsqueeze(1)
+        ship_pos_y = x["ship_pos_y"].cuda().unsqueeze(1)
         ship_pos_x_embs = self.pos_emb_x(ship_pos_x)
         ship_pos_y_embs = self.pos_emb_y(ship_pos_y)
         ship_pos_embs = torch.cat([ship_pos_x_embs, ship_pos_y_embs], dim=2).expand(-1, self.tgt_len, -1)
-        team_embs = self.team_emb(x["team_id"].to(self.device)).expand(-1, self.tgt_len, -1)
+        team_embs = self.team_emb(x["team_id"].cuda()).expand(-1, self.tgt_len, -1)
         
         tgt = pos_embs + ship_pos_embs + team_embs
-        tgt_mask = x["action_mask"].to(self.device).bool()
+        tgt_mask = x["action_mask"].cuda().bool()
         return tgt, tgt_mask
         
     
@@ -253,29 +270,126 @@ class KoreNet(nn.Module):
         tgt, tgt_key_padding_mask = self.prepare_target_seq(x)
         src = src.permute(1, 0, 2)
         tgt = tgt.permute(1, 0, 2)
-        
+
         out = self.transformer(src, tgt, src_key_padding_mask=src_key_padding_mask, tgt_key_padding_mask=tgt_key_padding_mask)
         out = out.permute(1, 0, 2)
         out = self.fc(out)
         return out
 
 
+class LightningModel(pl.LightningModule):
+    def __init__(
+        self, 
+        lr, 
+        weight_decay,
+        warmup_steps,
+        batch_size, 
+        num_epochs, 
+        num_gpus, 
+        num_samples
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.warmup_steps = warmup_steps
+        self.batch_size = batch_size
+        self.num_epochs = num_epochs
+        self.num_gpus = num_gpus
+        self.num_samples = num_samples
+
+        self.net = KoreNet(input_ch=11, batch_size=batch_size)
+        self.ce_loss = nn.CrossEntropyLoss(reduction="none")
+    
+    def forward(self, x):
+        return self.net(x)
+    
+    def training_step(self, batch, batch_idx):
+        action, action_mask = batch["action"], batch["action_mask"]
+        out = self(batch)
+        out = out.permute(0, 2, 1)
+        loss = (self.ce_loss(out, action) * action_mask).sum() / action_mask.sum()
+        self.log("train_loss", loss)
+        return loss
+    
+    def training_step_end(self, training_step_outputs):
+        (lr,) = self.scheduler.get_last_lr()
+        self.log("lr", lr)
+    
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
+            self.net.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
+        total_steps = (
+            self.num_samples
+            * self.num_epochs
+            // self.batch_size
+            // self.num_gpus
+        )
+        # self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=self.num_epochs, eta_min=1e-8)
+        self.scheduler = get_cosine_schedule_with_warmup(
+            optimizer, num_warmup_steps=self.warmup_steps, num_training_steps=total_steps
+        )
+        lr_scheduler_config = {
+            "scheduler": self.scheduler,
+            "interval": "step",
+            "frequency": 1,
+        }
+        return {"optimizer": optimizer, "lr_scheduler": lr_scheduler_config}
+
+
 base_path = "/var/scratch/kvu400"
 
 def main(
+    lr=5e-4,
+    weight_decay=1e-6,
+    warmup_steps=4000,
+    num_gpus=1,
+    num_epochs=5,
+    batch_size=32,
     train_csv_dir=os.path.join(base_path, "kore/train.csv"),
-    tensor_dir=os.path.join(base_path, "kore/replays_tensors")
+    tensor_dir=os.path.join(base_path, "kore/replays_tensors"),
 ):
     df = pd.read_csv(train_csv_dir)
     train_ds = KoreTensorDataset(data=df, data_path=tensor_dir)
-    train_loader = DataLoader(train_ds, collate_fn=CustomCollateFn, batch_size=8, num_workers=0, pin_memory=True, shuffle=False)
+    train_loader = DataLoader(train_ds, collate_fn=CustomCollateFn, batch_size=batch_size, num_workers=8, pin_memory=True, shuffle=True)
 
-    profiler = Timer()
-    for _ in range(25):
-        batch = next(iter(train_loader))
-        profile(profiler, "load a single batch from disk")
+    # profiler = Timer()
+    # for _ in range(25):
+    #     batch = next(iter(train_loader))
+    #     profile(profiler, "load a single batch from disk")
+
+    model = LightningModel(
+        lr=lr,
+        weight_decay=weight_decay,
+        warmup_steps=warmup_steps,
+        batch_size=batch_size, 
+        num_gpus=num_gpus,
+        num_epochs=num_epochs,
+        num_samples=len(train_ds),
+    )
+    
+    log_dir = os.path.join(base_path, "logs/" + datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
+    os.makedirs(log_dir, exist_ok=False)
+    print("Logs and model checkpoint will be saved to", log_dir)
+
+    trainer = pl.Trainer(
+        accelerator="gpu",
+        devices=num_gpus,
+        deterministic=True,
+        precision=32,
+        fast_dev_run=False,
+        default_root_dir=log_dir,
+        max_epochs=num_epochs, 
+        track_grad_norm=2,
+        enable_progress_bar=True
+    )
+
+    trainer.fit(model, train_loader)
 
 
 if __name__ == "__main__":
-    main()
+    fire.Fire(main)
 

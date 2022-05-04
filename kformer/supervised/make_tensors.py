@@ -38,8 +38,8 @@ class KoreDataset(Dataset):
         return obs
     
     def get_feature_map(self, obs, player):
-        def normalize(x: torch.tensor) -> torch.tensor:
-            return (x - x.min()) / x.max()
+        def normalize(x: torch.tensor, eps=1e-8) -> torch.tensor:
+            return (x - x.min()) / (x.max() + eps)
         
         kore = torch.tensor(obs["kore"]).float().view(1, 21, 21)
     
@@ -177,9 +177,9 @@ class KoreDataset(Dataset):
         player = row["Player"]
         step = row["Step"]
         ep_id = str(row["EpisodeId"])
-        profile(profiler, "initialize")
+        profile(profiler, "initialize", self.debug)
         
-        obs = self.get_obs_at_step(ep_id, step) # Get observation from step-1
+        obs = self.get_obs_at_step(ep_id, step) # Get observation from the previous step
         ship_pos_x, ship_pos_y = self.get_shipyard_pos(
             obs, 
             row["ShipyardId"], 
@@ -222,7 +222,7 @@ def main(
     json_dir=os.path.join(base_path, "kore/replays"), 
     encoder_dir=os.path.join(base_path, "kore/encoder_jit.pt"), 
     train_csv_dir=os.path.join(base_path, "kore/train.csv"),
-    target_dir=os.path.join(base_path, "kore/dataset.zip")
+    target_dir=os.path.join(base_path, "kore/replays_tensors.zip")
 ):
     df = pd.read_csv(train_csv_dir)
     print(df.head())
