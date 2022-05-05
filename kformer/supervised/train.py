@@ -79,19 +79,21 @@ def CustomCollateFn(batch):
     batch_opp_fleet_emb = [pad_embedding(a, torch.zeros((1, a.shape[1])), max_opp_fleet_len-a.shape[0]) for a in batch_opp_fleet_emb]
     batch_opp_fleet_emb = torch.vstack([a.unsqueeze(0) for a in batch_opp_fleet_emb])
     
-    batch_team_fleet_mask = torch.tensor([[False] * max_team_fleet_len] * len(batch)).bool()
+    # ATTENTION!
+    # Pad = True, not-pad = False
+    batch_team_fleet_mask = torch.tensor([[True] * max_team_fleet_len] * len(batch)).bool()
     for i in range(len(batch)):
-        batch_team_fleet_mask[i, :len(batch[i]["team_fleet_pos"])] = True
+        batch_team_fleet_mask[i, :len(batch[i]["team_fleet_pos"])] = False
     
-    batch_opp_fleet_mask = torch.tensor([[False] * max_opp_fleet_len] * len(batch)).bool()
+    batch_opp_fleet_mask = torch.tensor([[True] * max_opp_fleet_len] * len(batch)).bool()
     for i in range(len(batch)):
-        batch_opp_fleet_mask[i, :len(batch[i]["opp_fleet_pos"])] = True
+        batch_opp_fleet_mask[i, :len(batch[i]["opp_fleet_pos"])] = False
     
     # max_action_len = max([len(x["action"]) for x in batch])
     max_action_len = 20
-    batch_action_mask = torch.tensor([[0] * max_action_len] * len(batch)).long()
+    batch_action_mask = torch.tensor([[True] * max_action_len] * len(batch)).bool()
     for i in range(len(batch)):
-        batch_action_mask[i, 0:len(batch[i]["action"])] = 1
+        batch_action_mask[i, :len(batch[i]["action"])] = False
         
     batch_action = [x["action"] for x in batch]
     batch_action = [pad(a, shipyard_w2i["PAD"], max_action_len-len(a)) for a in batch_action]
@@ -132,24 +134,31 @@ class TorusConv2d(nn.Module):
 
 
 class SpatialEncoder(nn.Module):
-    def __init__(self, input_ch, filters=32, layers=12):
+    def __init__(self, input_ch, filters, layers):
         super().__init__()
-        self.conv0 = TorusConv2d(input_ch, filters, (3, 3), True)
-        self.blocks = nn.ModuleList([TorusConv2d(filters, filters, (3, 3), True) for _ in range(layers)])
+        self.conv0 = TorusConv2d(input_ch, filters, (3, 3), bn=True)
+        self.blocks = nn.ModuleList([TorusConv2d(filters, filters, (3, 3), bn=True) for _ in range(layers)])
+        # self._init_weight()
 
     def forward(self, x):
-        h = F.relu_(self.conv0(x))
+        h = self.conv0(x)
         for block in self.blocks:
-            h = F.relu_(h + block(h))
+            h = h + F.relu_(block(h))
         return h
+    
+    def _init_weight(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
 
-class KoreNet(nn.Module):
-    def __init__(self, input_ch, batch_size):
+class ScalarEncoder(nn.Module):
+    def __init__(self, input_dim, output_dim):
         super().__init__()
-        self.batch_size = batch_size
-
-        self.scalar_encoder = nn.Sequential(
+        self.fc = nn.Sequential(
             nn.Linear(3, 128),
             nn.BatchNorm1d(128), # Is bn neccessary?
             nn.ReLU(),
@@ -158,15 +167,21 @@ class KoreNet(nn.Module):
             nn.ReLU(),
             nn.Linear(128, 288),
         )
+    
+    def forward(self, x):
+        return self.fc(x)
 
-        self.spatial_encoder = SpatialEncoder(input_ch, filters=32, layers=12)    
+
+class KoreNet(nn.Module):
+    def __init__(self, input_ch, batch_size):
+        super().__init__()
+        self.batch_size = batch_size
+        self.scalar_encoder = ScalarEncoder(3, 288)
+        self.spatial_encoder = SpatialEncoder(input_ch, filters=32, layers=12)  
         self.up_projection = nn.Sequential(
             nn.Linear(32, 288),
             nn.LayerNorm(288)
         )
-
-        self.pos_emb_x = nn.Embedding(22, 144, padding_idx=21)
-        self.pos_emb_y = nn.Embedding(22, 144, padding_idx=21)
 
         # domain coding:
         # SEP token = 0
@@ -174,32 +189,33 @@ class KoreNet(nn.Module):
         # spatial = 2
         # fleet = 3
         self.domain_emb = nn.Embedding(4, 288, padding_idx=0)
-
         self.seq_pos_emb = nn.Embedding(1000, 288)
         self.sep_token = nn.Parameter(torch.zeros(1, 288)).cuda()
-
         self.tgt_len = 20
         self.tgt_pos_emb = nn.Embedding(20, 288)
         self.team_emb = nn.Embedding(10, 288) # Sanity check! Max team nr. is 10?
+        self.pos_emb_x = nn.Embedding(22, 144, padding_idx=21)
+        self.pos_emb_y = nn.Embedding(22, 144, padding_idx=21)
 
         self.transformer_encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=288, nhead=4, dim_feedforward=1024),
-            num_layers=12,
+            nn.TransformerEncoderLayer(d_model=288, nhead=8, dim_feedforward=2048, activation="relu"),
+            num_layers=6,
         )
         self.transformer_decoder = nn.TransformerDecoder(
-            nn.TransformerDecoderLayer(d_model=288, nhead=4, dim_feedforward=512), 
-            num_layers=4
+            nn.TransformerDecoderLayer(d_model=288, nhead=8, dim_feedforward=2048, activation="relu"), 
+            num_layers=3
         )
         self.fc = nn.Linear(288, 23, bias=False)
     
     def prepare_input_seq(self, x):
         global_info = x["global_info"]
         scalar_token = self.scalar_encoder(global_info).unsqueeze(1) # shape (bs, 1, 288)
+        # print("scalar", scalar_token)
         
-        fmap = x["fmap"]
-        fmap = self.spatial_encoder(fmap)
+        fmap = self.spatial_encoder(x["fmap"])
         spatial_tokens = fmap.view(fmap.shape[0], fmap.shape[1], -1).permute(0, 2, 1)
         spatial_tokens = self.up_projection(spatial_tokens) # shape (bs, 441, 288)
+        # print("spatial", spatial_tokens)
 
         map_pos_x_embs = torch.arange(21, device="cuda").unsqueeze(1).repeat(1, 21).view(1, -1).expand(fmap.shape[0], 21 * 21)
         map_pos_x_embs = self.pos_emb_x(map_pos_x_embs.long()) # input to f.embedding is a Long tensor
@@ -223,25 +239,25 @@ class KoreNet(nn.Module):
         # Full sequence
         sep_token = self.sep_token.unsqueeze(0).expand(fmap.shape[0], 1, -1) # shape (bs, 1, 288)
         seq = torch.cat([scalar_token, spatial_tokens, sep_token, team_fleet_tokens, sep_token, opp_fleet_tokens], dim=1)
-        # seq = global_info + spatial_tokens + [SEP] + team_fleet_tokens + [SEP] + opp_fleet_tokens
         
         domain_tokens = [1] + [2] * spatial_tokens.shape[1] + [0] + [3] * team_fleet_tokens.shape[1] + [0] + [3] * opp_fleet_tokens.shape[1]
         domain_tokens = torch.tensor(domain_tokens, device="cuda").unsqueeze(0).expand(self.batch_size, -1)
         domain_embs = self.domain_emb(domain_tokens.long())
-        seq += domain_embs
         
         seq_pos_embs = torch.arange(seq.shape[1], device="cuda").unsqueeze(0).expand(seq.shape[0], -1)
         seq_pos_embs = self.seq_pos_emb(seq_pos_embs.long())
-        seq += seq_pos_embs
+        seq = seq + domain_embs + seq_pos_embs
         
         # Sequence mask
+        # ATTENTION!
+        # Pad = True, not-pad = False
+        global_info_mask = torch.tensor([False], device="cuda", dtype=torch.bool).expand(seq.shape[0]).unsqueeze(1)
+        sep_mask = torch.tensor([True], device="cuda", dtype=torch.bool).expand(seq.shape[0]).unsqueeze(1)
+        spatial_mask = torch.tensor(False, device="cuda", dtype=torch.bool).expand(seq.shape[0], 21 * 21)
         team_fleet_mask = x["team_fleet_mask"].bool()
         opp_fleet_mask = x["opp_fleet_mask"].bool()
-        global_info_mask = torch.tensor([True], device="cuda", dtype=torch.bool).expand(seq.shape[0]).unsqueeze(1)
-        sep_mask = torch.tensor([False], device="cuda", dtype=torch.bool).expand(seq.shape[0]).unsqueeze(1)
-        spatial_mask = torch.tensor(True, device="cuda", dtype=torch.bool).expand(seq.shape[0], 21 * 21)
         seq_mask = torch.cat([global_info_mask, spatial_mask, sep_mask, team_fleet_mask, sep_mask, opp_fleet_mask], dim=1)
-        
+
         return seq, seq_mask
     
     def prepare_target_seq(self, x):
@@ -253,19 +269,24 @@ class KoreNet(nn.Module):
         ship_pos_x_embs = self.pos_emb_x(ship_pos_x.long())
         ship_pos_y_embs = self.pos_emb_y(ship_pos_y.long())
         ship_pos_embs = torch.cat([ship_pos_x_embs, ship_pos_y_embs], dim=2).expand(-1, self.tgt_len, -1)
-        team_embs = self.team_emb(x["team_id"]).expand(-1, self.tgt_len, -1)
         
+        team_embs = self.team_emb(x["team_id"]).expand(-1, self.tgt_len, -1)
+
         tgt = pos_embs + ship_pos_embs + team_embs
-        tgt_mask = x["action_mask"].bool()
+
+        tgt_mask = x["action_mask"]
         return tgt, tgt_mask
     
     def get_encoder_output(self, src, src_key_padding_mask):
-        return self.transformer_encoder(src, src_key_padding_mask=src_key_padding_mask)
+        return self.transformer_encoder(
+            src, 
+            src_key_padding_mask=src_key_padding_mask
+        )
     
     def get_decoder_output(self, memory, tgt, tgt_key_padding_mask, memory_key_padding_mask):
         return self.transformer_decoder(
-            tgt, 
-            memory, 
+            tgt=tgt, 
+            memory=memory, 
             tgt_key_padding_mask=tgt_key_padding_mask,
             memory_key_padding_mask=memory_key_padding_mask
         )
@@ -276,12 +297,6 @@ class KoreNet(nn.Module):
         src = src.permute(1, 0, 2)
         tgt = tgt.permute(1, 0, 2)
 
-        # out = self.transformer(
-        #     src, 
-        #     tgt, 
-        #     src_key_padding_mask=src_key_padding_mask, 
-        #     tgt_key_padding_mask=tgt_key_padding_mask
-        # )
         memory = self.get_encoder_output(src, src_key_padding_mask)
         out = self.get_decoder_output(
             memory, 
@@ -289,6 +304,7 @@ class KoreNet(nn.Module):
             tgt_key_padding_mask, 
             memory_key_padding_mask=src_key_padding_mask
         )
+
         out = out.permute(1, 0, 2)
         out = self.fc(out)
         return out
@@ -325,7 +341,8 @@ class LightningModel(pl.LightningModule):
         action, action_mask = batch["action"], batch["action_mask"]
         out = self(batch)
         out = out.permute(0, 2, 1)
-        loss = (self.ce_loss(out, action) * action_mask).sum() / action_mask.sum()
+        loss_mask = (1 - action_mask.long()) # Flip the mask
+        loss = (self.ce_loss(out, action) * loss_mask).sum() / loss_mask.sum()
         self.log("train_loss", loss)
         return loss
     
@@ -333,12 +350,12 @@ class LightningModel(pl.LightningModule):
         action, action_mask = batch["action"], batch["action_mask"]
         out = self(batch)
         out = out.permute(0, 2, 1) 
-        loss = (self.ce_loss(out, action) * action_mask).sum() / action_mask.sum()
+        loss_mask = (1 - action_mask.long())
+        loss = (self.ce_loss(out, action) * loss_mask).sum() / loss_mask.sum()
         self.log("val_loss", loss)
         return {
             "out": out.detach().cpu(),
-            "action": action.detach().cpu(),
-            "action_mask": action_mask.detach().cpu()
+            "action": action.detach().cpu()
         }
     
     def validation_epoch_end(self, validation_step_outputs):
@@ -350,7 +367,6 @@ class LightningModel(pl.LightningModule):
         preds = torch.cat(outs["out"], dim=0) # shape (n, 23, 20)
         preds = torch.softmax(preds.permute(0, 2, 1), dim=1).argmax(dim=1)
         actions = torch.cat(outs["action"], dim=0) # shape (n, 20)
-        action_masks = torch.cat(outs["action_mask"], dim=0) # shape (n, 20)
         preds = preds.tolist()
         actions = actions.tolist()
 
@@ -392,7 +408,7 @@ class LightningModel(pl.LightningModule):
     
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
-            self.net.parameters(),
+            self.parameters(),
             lr=self.lr,
             weight_decay=self.weight_decay,
         )
@@ -455,11 +471,6 @@ def main(
         shuffle=False
     )
 
-    # profiler = Timer()
-    # for _ in range(25):
-    #     batch = next(iter(train_loader))
-    #     profile(profiler, "load a single batch from disk")
-
     model = LightningModel(
         lr=lr,
         weight_decay=weight_decay,
@@ -481,6 +492,8 @@ def main(
         deterministic=True,
         precision=32,
         strategy="ddp",
+        detect_anomaly=debug,
+        log_every_n_steps=1 if debug else 50,
         fast_dev_run=5 if debug else False,
         default_root_dir=log_dir,
         max_epochs=num_epochs, 
