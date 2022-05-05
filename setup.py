@@ -10,6 +10,7 @@ setup(
         "pandas",  
         "scikit-learn",
         "black",
-        "pympler"
+        "pympler",
+        "datasets",
     ],
 )
