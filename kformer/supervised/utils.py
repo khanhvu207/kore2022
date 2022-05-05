@@ -122,6 +122,7 @@ shipyard_w2i = {
     "LAUNCH": 21,
     "SPAWN": 22
 }
+shipyard_i2w = {v: k for k, v in shipyard_w2i.items()}
 
 fleet_dir = {
     0: "N",
