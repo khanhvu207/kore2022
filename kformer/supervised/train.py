@@ -173,9 +173,8 @@ class ScalarEncoder(nn.Module):
 
 
 class KoreNet(nn.Module):
-    def __init__(self, input_ch, batch_size):
+    def __init__(self, input_ch):
         super().__init__()
-        self.batch_size = batch_size
         self.scalar_encoder = ScalarEncoder(3, 288)
         self.spatial_encoder = SpatialEncoder(input_ch, filters=32, layers=12)  
         self.up_projection = nn.Sequential(
@@ -209,6 +208,7 @@ class KoreNet(nn.Module):
     
     def prepare_input_seq(self, x):
         global_info = x["global_info"]
+        self.batch_size = global_info.shape[0]
         scalar_token = self.scalar_encoder(global_info).unsqueeze(1) # shape (bs, 1, 288)
         # print("scalar", scalar_token)
         
@@ -331,7 +331,7 @@ class LightningModel(pl.LightningModule):
         self.num_gpus = num_gpus
         self.num_samples = num_samples
 
-        self.net = KoreNet(input_ch=11, batch_size=batch_size)
+        self.net = KoreNet(input_ch=11)
         self.ce_loss = nn.CrossEntropyLoss(reduction="none")
     
     def forward(self, x):
