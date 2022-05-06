@@ -138,21 +138,12 @@ class SpatialEncoder(nn.Module):
         super().__init__()
         self.conv0 = TorusConv2d(input_ch, filters, (3, 3), bn=True)
         self.blocks = nn.ModuleList([TorusConv2d(filters, filters, (3, 3), bn=True) for _ in range(layers)])
-        # self._init_weight()
 
     def forward(self, x):
         h = self.conv0(x)
         for block in self.blocks:
             h = h + F.relu_(block(h))
         return h
-    
-    def _init_weight(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
 
 
 class ScalarEncoder(nn.Module):
@@ -170,6 +161,14 @@ class ScalarEncoder(nn.Module):
     
     def forward(self, x):
         return self.fc(x)
+        
+
+def he_initialization(m):
+    if isinstance(m, (nn.Linear, nn.Conv2d)):
+        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+    elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+        nn.init.constant_(m.weight, 1)
+        nn.init.constant_(m.bias, 0)
 
 
 class KoreNet(nn.Module):
@@ -181,6 +180,11 @@ class KoreNet(nn.Module):
             nn.Linear(32, 288),
             nn.LayerNorm(288)
         )
+
+        # Proper initialization is crucial
+        # https://github.com/pytorch/pytorch/issues/18182
+        self.scalar_encoder.apply(he_initialization)
+        self.spatial_encoder.apply(he_initialization)
 
         # domain coding:
         # SEP token = 0
@@ -393,7 +397,6 @@ class LightningModel(pl.LightningModule):
 
         bleu = datasets.load_metric("bleu")
         results = bleu.compute(predictions=predictions, references=references)
-        self.log("bleu", results["bleu"])
         self.log("1-gram precision", results["precisions"][0])
 
         flatten_predictions = np.concatenate(predictions)
