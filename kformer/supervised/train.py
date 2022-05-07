@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import Dataset, DataLoader
 
 import datasets
@@ -178,7 +179,7 @@ class KoreNet(nn.Module):
         self.spatial_encoder = SpatialEncoder(input_ch, filters=32, layers=12)  
         self.up_projection = nn.Sequential(
             nn.Linear(32, 288),
-            nn.LayerNorm(288)
+            # nn.LayerNorm(288)
         )
 
         # Proper initialization is crucial
@@ -201,11 +202,23 @@ class KoreNet(nn.Module):
         self.pos_emb_y = nn.Embedding(22, 144, padding_idx=21)
 
         self.transformer_encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=288, nhead=8, dim_feedforward=2048, activation="relu"),
-            num_layers=6,
+            nn.TransformerEncoderLayer(
+                d_model=288, 
+                nhead=4, 
+                dim_feedforward=768, 
+                activation="gelu", 
+                norm_first=True
+            ),
+            num_layers=3,
         )
         self.transformer_decoder = nn.TransformerDecoder(
-            nn.TransformerDecoderLayer(d_model=288, nhead=8, dim_feedforward=2048, activation="relu"), 
+            nn.TransformerDecoderLayer(
+                d_model=288, 
+                nhead=4, 
+                dim_feedforward=768, 
+                activation="gelu", 
+                norm_first=True
+            ), 
             num_layers=3
         )
         self.fc = nn.Linear(288, 23, bias=False)
@@ -291,7 +304,7 @@ class KoreNet(nn.Module):
         return self.transformer_decoder(
             tgt=tgt, 
             memory=memory, 
-            tgt_key_padding_mask=tgt_key_padding_mask,
+            # tgt_key_padding_mask=tgt_key_padding_mask,
             memory_key_padding_mask=memory_key_padding_mask
         )
 
@@ -319,7 +332,7 @@ class LightningModel(pl.LightningModule):
         self, 
         lr, 
         weight_decay,
-        warmup_steps,
+        warmup_ratio,
         batch_size, 
         num_epochs, 
         num_gpus, 
@@ -329,7 +342,7 @@ class LightningModel(pl.LightningModule):
         self.save_hyperparameters()
         self.lr = lr
         self.weight_decay = weight_decay
-        self.warmup_steps = warmup_steps
+        self.warmup_ratio = warmup_ratio
         self.batch_size = batch_size
         self.num_epochs = num_epochs
         self.num_gpus = num_gpus
@@ -421,6 +434,8 @@ class LightningModel(pl.LightningModule):
             // self.batch_size
             // self.num_gpus
         )
+        self.warmup_steps = int(self.warmup_ratio * total_steps)
+        print(f"Number of warm-up steps: {self.warmup_steps}/{total_steps}")
         self.scheduler = get_cosine_schedule_with_warmup(
             optimizer, num_warmup_steps=self.warmup_steps, num_training_steps=total_steps
         )
@@ -436,7 +451,8 @@ base_path = "/var/scratch/kvu400"
 def main(
     lr=5e-4,
     weight_decay=1e-6,
-    warmup_steps=4000,
+    warmup_ratio=0.1,
+    gradient_clip_val=0.5,
     num_gpus=1,
     num_epochs=5,
     batch_size=32,
@@ -477,7 +493,7 @@ def main(
     model = LightningModel(
         lr=lr,
         weight_decay=weight_decay,
-        warmup_steps=warmup_steps,
+        warmup_ratio=warmup_ratio,
         batch_size=batch_size, 
         num_gpus=num_gpus,
         num_epochs=num_epochs,
@@ -489,6 +505,13 @@ def main(
         os.makedirs(log_dir, exist_ok=False)
         print("Logs and model checkpoint will be saved to", log_dir)
 
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val_loss",
+        mode="min",
+        dirpath=log_dir,
+    )
+    callback_list = [checkpoint_callback] if not debug else []
+
     trainer = pl.Trainer(
         accelerator="gpu",
         devices=num_gpus,
@@ -499,11 +522,13 @@ def main(
         log_every_n_steps=1 if debug else 50,
         fast_dev_run=5 if debug else False,
         default_root_dir=log_dir,
+        gradient_clip_val=1.0, 
         max_epochs=num_epochs, 
         track_grad_norm=2,
         enable_progress_bar=True,
         logger=not debug,
-        checkpoint_callback=not debug
+        enable_checkpointing=not debug,
+        callbacks=callback_list,
     )
 
     trainer.fit(model, train_loader, val_loader)
