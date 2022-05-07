@@ -194,7 +194,7 @@ class KoreNet(nn.Module):
         # fleet = 3
         self.domain_emb = nn.Embedding(4, 288, padding_idx=0)
         self.seq_pos_emb = nn.Embedding(1000, 288)
-        self.sep_token = nn.Parameter(torch.zeros(1, 288)).cuda()
+        self.sep_token = nn.Parameter(torch.zeros(1, 288))
         self.tgt_len = 20
         self.tgt_pos_emb = nn.Embedding(20, 288)
         self.team_emb = nn.Embedding(10, 288) # Sanity check! Max team nr. is 10?
@@ -224,6 +224,9 @@ class KoreNet(nn.Module):
         self.fc = nn.Linear(288, 23, bias=False)
     
     def prepare_input_seq(self, x):
+        # Current cuda device
+        self.cur_device = x["fmap"].device
+
         global_info = x["global_info"]
         self.batch_size = global_info.shape[0]
         scalar_token = self.scalar_encoder(global_info).unsqueeze(1) # shape (bs, 1, 288)
@@ -234,9 +237,9 @@ class KoreNet(nn.Module):
         spatial_tokens = self.up_projection(spatial_tokens) # shape (bs, 441, 288)
         # print("spatial", spatial_tokens)
 
-        map_pos_x_embs = torch.arange(21, device="cuda").unsqueeze(1).repeat(1, 21).view(1, -1).expand(fmap.shape[0], 21 * 21)
+        map_pos_x_embs = torch.arange(21, device=self.cur_device).unsqueeze(1).repeat(1, 21).view(1, -1).expand(fmap.shape[0], 21 * 21)
         map_pos_x_embs = self.pos_emb_x(map_pos_x_embs.long()) # input to f.embedding is a Long tensor
-        map_pos_y_embs = torch.arange(21, device="cuda").unsqueeze(0).repeat(fmap.shape[0], 21)
+        map_pos_y_embs = torch.arange(21, device=self.cur_device).unsqueeze(0).repeat(fmap.shape[0], 21)
         map_pos_y_embs = self.pos_emb_y(map_pos_y_embs.long())
         map_pos_embs = torch.cat([map_pos_x_embs, map_pos_y_embs], dim=2)
         spatial_tokens += map_pos_embs
@@ -258,19 +261,19 @@ class KoreNet(nn.Module):
         seq = torch.cat([scalar_token, spatial_tokens, sep_token, team_fleet_tokens, sep_token, opp_fleet_tokens], dim=1)
         
         domain_tokens = [1] + [2] * spatial_tokens.shape[1] + [0] + [3] * team_fleet_tokens.shape[1] + [0] + [3] * opp_fleet_tokens.shape[1]
-        domain_tokens = torch.tensor(domain_tokens, device="cuda").unsqueeze(0).expand(self.batch_size, -1)
+        domain_tokens = torch.tensor(domain_tokens, device=self.cur_device).unsqueeze(0).expand(self.batch_size, -1)
         domain_embs = self.domain_emb(domain_tokens.long())
         
-        seq_pos_embs = torch.arange(seq.shape[1], device="cuda").unsqueeze(0).expand(seq.shape[0], -1)
+        seq_pos_embs = torch.arange(seq.shape[1], device=self.cur_device).unsqueeze(0).expand(seq.shape[0], -1)
         seq_pos_embs = self.seq_pos_emb(seq_pos_embs.long())
         seq = seq + domain_embs + seq_pos_embs
         
         # Sequence mask
         # ATTENTION!
         # Pad = True, not-pad = False
-        global_info_mask = torch.tensor([False], device="cuda", dtype=torch.bool).expand(seq.shape[0]).unsqueeze(1)
-        sep_mask = torch.tensor([True], device="cuda", dtype=torch.bool).expand(seq.shape[0]).unsqueeze(1)
-        spatial_mask = torch.tensor(False, device="cuda", dtype=torch.bool).expand(seq.shape[0], 21 * 21)
+        global_info_mask = torch.tensor([False], device=self.cur_device, dtype=torch.bool).expand(seq.shape[0]).unsqueeze(1)
+        sep_mask = torch.tensor([True], device=self.cur_device, dtype=torch.bool).expand(seq.shape[0]).unsqueeze(1)
+        spatial_mask = torch.tensor(False, device=self.cur_device, dtype=torch.bool).expand(seq.shape[0], 21 * 21)
         team_fleet_mask = x["team_fleet_mask"].bool()
         opp_fleet_mask = x["opp_fleet_mask"].bool()
         seq_mask = torch.cat([global_info_mask, spatial_mask, sep_mask, team_fleet_mask, sep_mask, opp_fleet_mask], dim=1)
@@ -278,7 +281,7 @@ class KoreNet(nn.Module):
         return seq, seq_mask
     
     def prepare_target_seq(self, x):
-        pos_embs = torch.arange(self.tgt_len, device="cuda")
+        pos_embs = torch.arange(self.tgt_len, device=self.cur_device)
         pos_embs = self.tgt_pos_emb(pos_embs.long()).unsqueeze(0).expand(self.batch_size, -1, -1)
 
         ship_pos_x = x["ship_pos_x"].unsqueeze(1)
