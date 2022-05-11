@@ -91,12 +91,9 @@ fleet_w2i = {
     "W": 13,
     "C": 14,
     "CLS": 15,
-    "SEP": 16,
-    "EOS": 17,
-    "PAD": 18,
-    "MASK": 19,
+    "EOS": 16,
+    "PAD": 17,
 }
-
 shipyard_w2i = {
     "0": 0,
     "1": 1,
@@ -114,19 +111,18 @@ shipyard_w2i = {
     "W": 13,
     "C": 14,
     "CLS": 15,
-    "SEP": 16,
-    "EOS": 17,
-    "PAD": 18,
-    "MASK": 19,
-    "IDLE": 20,
-    "LAUNCH": 21,
-    "SPAWN": 22
+    "EOS": 16,
+    "PAD": 17,
 }
-shipyard_i2w = {v: k for k, v in shipyard_w2i.items()}
-
 fleet_dir = {
     0: "N",
     1: "E",
     2: "S",
     3: "W"
 }
+action_encoder = {
+    "IDLE": 0,
+    "SPAWN": 1,
+    "LAUNCH": 2
+}
+shipyard_i2w = {v: k for k, v in shipyard_w2i.items()}
