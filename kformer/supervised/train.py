@@ -357,10 +357,10 @@ class LightningModel(pl.LightningModule):
         plan_loss = (plan_loss * batch["plan_mask"]).sum() / batch["plan_mask"].sum()
 
         loss = action_loss + cardinality_loss + plan_loss
-        self.log("train loss", loss)
-        self.log("action loss", action_loss)
-        self.log("cardinality loss", cardinality_loss)
-        self.log("plan loss", plan_loss)
+        self.log("train_loss", loss)
+        self.log("train_action_loss", action_loss)
+        self.log("train_cardinality_loss", cardinality_loss)
+        self.log("train_plan_loss", plan_loss)
         return loss
     
     def validation_step(self, batch, batch_idx):
@@ -375,10 +375,10 @@ class LightningModel(pl.LightningModule):
         plan_loss = (plan_loss * batch["plan_mask"]).sum() / batch["plan_mask"].sum()
 
         loss = action_loss + cardinality_loss + plan_loss
-        self.log("train loss", loss)
-        self.log("action loss", action_loss)
-        self.log("cardinality loss", cardinality_loss)
-        self.log("plan loss", plan_loss)
+        self.log("val_loss", loss)
+        self.log("val_action_loss", action_loss)
+        self.log("val_cardinality_loss", cardinality_loss)
+        self.log("val_plan_loss", plan_loss)
     
     # def validation_epoch_end(self, validation_step_outputs):
     #     outs = {
