@@ -447,16 +447,16 @@ def main(
         train_ds, 
         collate_fn=CustomCollateFn, 
         batch_size=batch_size, 
-        num_workers=4, 
+        num_workers=8, 
         pin_memory=True, 
         shuffle=True
     )
-    val_ds = KoreDataset(df=train_df, ep=ep)
+    val_ds = KoreDataset(df=val_df, ep=ep)
     val_loader = DataLoader(
         val_ds, 
         collate_fn=CustomCollateFn, 
         batch_size=batch_size, 
-        num_workers=4, 
+        num_workers=8, 
         pin_memory=True, 
         shuffle=False
     )
@@ -494,7 +494,7 @@ def main(
         log_every_n_steps=1 if debug else 50,
         fast_dev_run=5 if debug else False,
         default_root_dir=log_dir,
-        gradient_clip_val=1.0, 
+        gradient_clip_val=gradient_clip_val, 
         max_epochs=num_epochs, 
         track_grad_norm=2,
         enable_progress_bar=True,
