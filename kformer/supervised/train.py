@@ -101,12 +101,13 @@ class KoreDataset(Dataset):
         fleet = torch.vstack([team_fleet, opp_fleet])
         fleet_cargo = torch.vstack([team_fleet_cargo, opp_fleet_cargo])
         
-        kore = self._standardize(kore).float()
+        cur_max_kore = kore.max()
+        kore = self._normalize(kore / 500).float()
         shipyard = self._normalize(shipyard).float()
         shipyard_num_ship = self._normalize(shipyard_num_ship / 1000).float()
         shipyard_max_spawn = self._normalize(shipyard_max_spawn / 10).float()
         fleet = self._normalize(fleet / 1000).float()
-        fleet_cargo = self._standardize(fleet_cargo).float() # TODO: Should this be normalized relative to kore?
+        fleet_cargo = self._normalize(fleet_cargo / cur_max_kore).float()
         return torch.vstack([kore, shipyard, shipyard_num_ship, shipyard_max_spawn, fleet, fleet_cargo])
     
     def _tokenize_fleet_plan(self, plan, max_len):
@@ -170,12 +171,18 @@ class KoreDataset(Dataset):
         player_kore = obs["players"][player][0] / 100000
         opp_kore = obs["players"][1-player][0] / 100000
         team_id = self.team_le.transform([row["TeamName"]]).item()
+
         shipyard_pos_x = row["ShipyardPosX"]
         shipyard_pos_y = row["ShipyardPosY"]
         shipyard_nr_ship = int(row["ShipyardNrShip"]) / 500
         shipyard_turn_controlled = row["ShipyardTurnControlled"]
+        
         action = action_encoder[row["Action"]]
-        cardinality = int(row["Cardinality"]) / 500
+        spawn_nr = int(row["Spawn_nr"]) / 10
+        launch_nr = int(row["Launch_nr"]) / 100
+        is_spawn = row["Action"] == "SPAWN"
+        is_launch = row["Action"] == "LAUNCH"
+        
         plan = list(str(row["Plan"]) if str(row["Plan"]) != "nan" else "") + ["EOS"]
         plan = torch.tensor(list(map(shipyard_w2i.get, plan)), dtype=torch.long)
         profile(profiler, "finalizing", self.debug)
@@ -184,9 +191,11 @@ class KoreDataset(Dataset):
             step=step,
             team_id=team_id,
             fmap=fmap,
+            team_kore=player_kore,
             team_fleet_pos=team_fleet_pos,
             team_fleet_plan=team_fleet_plan,
             team_fleet_plan_mask=team_fleet_plan_mask,
+            opp_kore=opp_kore,
             opp_fleet_pos=opp_fleet_pos,
             opp_fleet_plan=opp_fleet_plan,
             opp_fleet_plan_mask=opp_fleet_plan_mask,
@@ -195,7 +204,10 @@ class KoreDataset(Dataset):
             shipyard_nr_ship=shipyard_nr_ship,
             shipyard_turn_controlled=shipyard_turn_controlled,
             action=action,
-            cardinality=cardinality,
+            spawn_nr=spawn_nr,
+            launch_nr=launch_nr,
+            is_spawn=is_spawn,
+            is_launch=is_launch,
             plan=plan,
         )
 
@@ -223,6 +235,7 @@ def CustomCollateFn(batch):
     
     batch_team_fleet_plan[:, :, 0] = fleet_w2i["CLS"]
     batch_team_fleet_plan_mask[:, :, 0] = False
+    batch_team_kore = torch.tensor([x["team_kore"] for x in batch], dtype=torch.float).unsqueeze(1)
     
     team_fleet_pos = [x["team_fleet_pos"] for x in batch]
     team_fleet_pos_x = [torch.tensor([x for x, y in pos]) for pos in team_fleet_pos]
@@ -249,6 +262,7 @@ def CustomCollateFn(batch):
     
     batch_opp_fleet_plan[:, :, 0] = fleet_w2i["CLS"]
     batch_opp_fleet_plan_mask[:, :, 0] = False
+    batch_opp_kore = torch.tensor([x["opp_kore"] for x in batch], dtype=torch.float).unsqueeze(1)
     
     opp_fleet_pos = [x["opp_fleet_pos"] for x in batch]
     opp_fleet_pos_x = [torch.tensor([x for x, y in pos]) for pos in opp_fleet_pos]
@@ -264,8 +278,10 @@ def CustomCollateFn(batch):
     batch_shipyard_nr_ship = torch.tensor([x["shipyard_nr_ship"] for x in batch], dtype=torch.float).unsqueeze(1)
     batch_shipyard_turn_controlled = torch.tensor([x["shipyard_turn_controlled"] for x in batch], dtype=torch.long).unsqueeze(1)
     batch_action = torch.tensor([x["action"] for x in batch], dtype=torch.long)
-    batch_cardinality = torch.tensor([x["cardinality"] for x in batch], dtype=torch.float).unsqueeze(1)
     
+    batch_spawn_nr = torch.tensor([x["spawn_nr"] for x in batch], dtype=torch.float).unsqueeze(1)
+    batch_launch_nr = torch.tensor([x["launch_nr"] for x in batch], dtype=torch.float).unsqueeze(1)
+
     plans = [x["plan"] for x in batch]
     max_plan_len = 19 # max([plan.shape[0] for plan in plans])
     batch_plan = torch.full((batch_size, max_plan_len), shipyard_w2i["PAD"], dtype=torch.long)
@@ -276,32 +292,34 @@ def CustomCollateFn(batch):
         batch_plan_mask[batch_idx, :plan_len] = 1
     
     # Sanity check
-    assert batch_step.shape == (batch_size, 1)
-    assert batch_team_id.shape == (batch_size, 1)
-    assert batch_fmap.shape == (batch_size, 11, 21, 21)
-    assert batch_team_fleet_mask.shape == (batch_size, team_max_fleet_size)
-    assert batch_team_fleet_plan.shape == (batch_size, team_max_fleet_size, team_max_fleet_plan)
-    assert batch_team_fleet_plan_mask.shape == (batch_size, team_max_fleet_size, team_max_fleet_plan)
-    assert batch_opp_fleet_mask.shape == (batch_size, opp_max_fleet_size)
-    assert batch_opp_fleet_plan.shape == (batch_size, opp_max_fleet_size, opp_max_fleet_plan)
-    assert batch_opp_fleet_plan_mask.shape == (batch_size, opp_max_fleet_size, opp_max_fleet_plan)
-    assert batch_shipyard_pos_x.shape == (batch_size, 1)
-    assert batch_shipyard_pos_y.shape == (batch_size, 1)
-    assert batch_shipyard_nr_ship.shape == (batch_size, 1)
-    assert batch_shipyard_turn_controlled.shape == (batch_size, 1)
-    assert batch_cardinality.shape == (batch_size, 1)
-    assert batch_plan.shape == (batch_size, max_plan_len)
-    assert batch_plan_mask.shape == (batch_size, max_plan_len)
+    # assert batch_step.shape == (batch_size, 1)
+    # assert batch_team_id.shape == (batch_size, 1)
+    # assert batch_fmap.shape == (batch_size, 11, 21, 21)
+    # assert batch_team_fleet_mask.shape == (batch_size, team_max_fleet_size)
+    # assert batch_team_fleet_plan.shape == (batch_size, team_max_fleet_size, team_max_fleet_plan)
+    # assert batch_team_fleet_plan_mask.shape == (batch_size, team_max_fleet_size, team_max_fleet_plan)
+    # assert batch_opp_fleet_mask.shape == (batch_size, opp_max_fleet_size)
+    # assert batch_opp_fleet_plan.shape == (batch_size, opp_max_fleet_size, opp_max_fleet_plan)
+    # assert batch_opp_fleet_plan_mask.shape == (batch_size, opp_max_fleet_size, opp_max_fleet_plan)
+    # assert batch_shipyard_pos_x.shape == (batch_size, 1)
+    # assert batch_shipyard_pos_y.shape == (batch_size, 1)
+    # assert batch_shipyard_nr_ship.shape == (batch_size, 1)
+    # assert batch_shipyard_turn_controlled.shape == (batch_size, 1)
+    # assert batch_cardinality.shape == (batch_size, 1)
+    # assert batch_plan.shape == (batch_size, max_plan_len)
+    # assert batch_plan_mask.shape == (batch_size, max_plan_len)
     
     return dict(
         step=batch_step,
         team_id=batch_team_id,
         fmap=batch_fmap,
+        team_kore=batch_team_kore,
         team_fleet_mask=batch_team_fleet_mask,
         team_fleet_plan=batch_team_fleet_plan,
         team_fleet_plan_mask=batch_team_fleet_plan_mask,
         team_fleet_pos_x=batch_team_fleet_pos_x,
         team_fleet_pos_y=batch_team_fleet_pos_y,
+        opp_kore=batch_opp_kore,
         opp_fleet_mask=batch_opp_fleet_mask,
         opp_fleet_plan=batch_opp_fleet_plan,
         opp_fleet_plan_mask=batch_opp_fleet_plan_mask,
@@ -312,7 +330,8 @@ def CustomCollateFn(batch):
         shipyard_nr_ship=batch_shipyard_nr_ship,
         shipyard_turn_controlled=batch_shipyard_turn_controlled,
         action=batch_action,
-        cardinality=batch_cardinality,
+        spawn_nr=batch_spawn_nr,
+        launch_nr=batch_launch_nr,
         plan=batch_plan,
         plan_mask=batch_plan_mask,
     )
@@ -323,7 +342,7 @@ class LightningModel(pl.LightningModule):
         self, 
         lr, 
         weight_decay,
-        warmup_ratio,
+        warmup_steps,
         batch_size, 
         num_epochs, 
         num_gpus, 
@@ -334,7 +353,7 @@ class LightningModel(pl.LightningModule):
         self.save_hyperparameters()
         self.lr = lr
         self.weight_decay = weight_decay
-        self.warmup_ratio = warmup_ratio
+        self.warmup_steps = warmup_steps
         self.batch_size = batch_size
         self.num_epochs = num_epochs
         self.num_gpus = num_gpus
@@ -402,7 +421,6 @@ class LightningModel(pl.LightningModule):
             // self.batch_size
             // self.num_gpus
         )
-        self.warmup_steps = int(self.warmup_ratio * total_steps)
         print(f"Number of warm-up steps: {self.warmup_steps}/{total_steps}")
         self.scheduler = get_cosine_schedule_with_warmup(
             optimizer, num_warmup_steps=self.warmup_steps, num_training_steps=total_steps
@@ -419,7 +437,7 @@ base_path = "/var/scratch/kvu400"
 def main(
     lr=5e-4,
     weight_decay=1e-6,
-    warmup_ratio=0.1,
+    warmup_steps=1000,
     gradient_clip_val=0.5,
     num_gpus=1,
     num_epochs=5,
@@ -464,7 +482,7 @@ def main(
     model = LightningModel(
         lr=lr,
         weight_decay=weight_decay,
-        warmup_ratio=warmup_ratio,
+        warmup_steps=warmup_steps,
         batch_size=batch_size, 
         num_gpus=num_gpus,
         num_epochs=num_epochs,
