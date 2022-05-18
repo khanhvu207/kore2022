@@ -15,3 +15,6 @@ I know this is the case by observing the losses and accuracies:
   - Represent shipyards as tokens.
 - The code is not bug-free.
   - Perform deep proofreading.
+- Bad hyperparameters:
+  - Learning rate was too large/too small
+  - Weight decay is too large?
