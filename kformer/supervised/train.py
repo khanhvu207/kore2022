@@ -376,7 +376,7 @@ class LightningModel(pl.LightningModule):
         
         action_loss = nn.CrossEntropyLoss()(out["action_logit"], batch["action"])
         
-        spawn_nr_loss = nn.CrossEntropyLoss(reduction="none")(out["spawn_nr_logit"], batch["spawn_nr"])
+        spawn_nr_loss = nn.CrossEntropyLoss(reduction="none")(out["spawn_nr_logit"], batch["spawn_nr"]).unsqueeze(1)
         spawn_nr_loss = (spawn_nr_loss * batch["is_spawn"]).sum() / (batch["is_spawn"].sum() + self.eps)
 
         launch_nr_loss = nn.MSELoss(reduction="none")(out["launch_nr_logit"], batch["launch_nr"])
@@ -400,7 +400,7 @@ class LightningModel(pl.LightningModule):
         
         action_loss = nn.CrossEntropyLoss()(out["action_logit"], batch["action"])
         
-        spawn_nr_loss = nn.CrossEntropyLoss(reduction="none")(out["spawn_nr_logit"], batch["spawn_nr"])
+        spawn_nr_loss = nn.CrossEntropyLoss(reduction="none")(out["spawn_nr_logit"], batch["spawn_nr"]).unsqueeze(1)
         spawn_nr_loss = (spawn_nr_loss * batch["is_spawn"]).sum() / (batch["is_spawn"].sum() + self.eps)
 
         launch_nr_loss = nn.MSELoss(reduction="none")(out["launch_nr_logit"], batch["launch_nr"])
