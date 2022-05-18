@@ -574,7 +574,7 @@ def main(
         print("Logs and model checkpoint will be saved to", log_dir)
 
     checkpoint_callback = ModelCheckpoint(
-        monitor="val_loss",
+        monitor="val/loss",
         mode="min",
         dirpath=log_dir,
     )
