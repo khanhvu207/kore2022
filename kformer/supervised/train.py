@@ -281,6 +281,8 @@ def CustomCollateFn(batch):
     
     batch_spawn_nr = torch.tensor([x["spawn_nr"] for x in batch], dtype=torch.float).unsqueeze(1)
     batch_launch_nr = torch.tensor([x["launch_nr"] for x in batch], dtype=torch.float).unsqueeze(1)
+    batch_is_spawn = torch.tensor([x["is_spawn"] for x in batch], dtype=torch.long).unsqueeze(1)
+    batch_is_launch = torch.tensor([x["is_launch"] for x in batch], dtype=torch.long).unsqueeze(1)
 
     plans = [x["plan"] for x in batch]
     max_plan_len = 19 # max([plan.shape[0] for plan in plans])
@@ -332,6 +334,8 @@ def CustomCollateFn(batch):
         action=batch_action,
         spawn_nr=batch_spawn_nr,
         launch_nr=batch_launch_nr,
+        is_spawn=batch_is_spawn,
+        is_launch=batch_is_launch,
         plan=batch_plan,
         plan_mask=batch_plan_mask,
     )
@@ -369,16 +373,20 @@ class LightningModel(pl.LightningModule):
         
         action_loss = nn.CrossEntropyLoss()(out["action_logit"], batch["action"])
         
-        cardinality_loss = nn.MSELoss()(out["cardinality_logit"], batch["cardinality"])
+        spawn_nr_loss = nn.MSELoss(reduction="none")(out["spawn_nr_logit"], batch["spawn_nr"])
+        spawn_nr_loss = (spawn_nr_loss * batch["is_spawn"]).sum() / batch["is_spawn"].sum()
+        launch_nr_loss = nn.MSELoss(reduction="none")(out["launch_nr_logit"], batch["launch_nr"])
+        launch_nr_loss = (launch_nr_loss * batch["is_launch"]).sum() / batch["is_launch"].sum()
         
         pred_plan = out["plan_logit"].permute(0, 2, 1)
         plan_loss = nn.CrossEntropyLoss(reduction="none")(pred_plan, batch["plan"])
         plan_loss = (plan_loss * batch["plan_mask"]).sum() / batch["plan_mask"].sum()
 
-        loss = action_loss + cardinality_loss + plan_loss
+        loss = action_loss + spawn_nr_loss + launch_nr_loss + plan_loss
         self.log("train_loss", loss)
         self.log("train_action_loss", action_loss)
-        self.log("train_cardinality_loss", cardinality_loss)
+        self.log("train_spawn_nr_loss", spawn_nr_loss)
+        self.log("train_launch_nr_loss", launch_nr_loss)
         self.log("train_plan_loss", plan_loss)
         return loss
     
@@ -387,23 +395,50 @@ class LightningModel(pl.LightningModule):
         
         action_loss = nn.CrossEntropyLoss()(out["action_logit"], batch["action"])
         
-        cardinality_loss = nn.MSELoss()(out["cardinality_logit"], batch["cardinality"])
+        spawn_nr_loss = nn.MSELoss(reduction="none")(out["spawn_nr_logit"], batch["spawn_nr"])
+        spawn_nr_loss = (spawn_nr_loss * batch["is_spawn"]).sum() / batch["is_spawn"].sum()
+        launch_nr_loss = nn.MSELoss(reduction="none")(out["launch_nr_logit"], batch["launch_nr"])
+        launch_nr_loss = (launch_nr_loss * batch["is_launch"]).sum() / batch["is_launch"].sum()
         
         pred_plan = out["plan_logit"].permute(0, 2, 1)
         plan_loss = nn.CrossEntropyLoss(reduction="none")(pred_plan, batch["plan"])
         plan_loss = (plan_loss * batch["plan_mask"]).sum() / batch["plan_mask"].sum()
 
-        loss = action_loss + cardinality_loss + plan_loss
+        loss = action_loss + spawn_nr_loss + launch_nr_loss + plan_loss
         self.log("val_loss", loss)
         self.log("val_action_loss", action_loss)
-        self.log("val_cardinality_loss", cardinality_loss)
+        self.log("val_spawn_nr_loss", spawn_nr_loss)
+        self.log("val_launch_nr_loss", launch_nr_loss)
         self.log("val_plan_loss", plan_loss)
+        return dict(
+            action_logit=out["action_logit"].detach().cpu(),
+            action=batch["action"].detach().cpu(),
+            # spawn_nr_logit=out["spawn_nr_logit"].detach().cpu(),
+            # spawn_nr=batch["spawn_nr"].detach().cpu(),
+            # launch_nr_logit=out["launch_nr_logit"].detach().cpu(),
+            # launch_nr=batch["launch_nr"].detach().cpu(),
+            plan_logit=out["plan_logit"].detach().cpu(),
+            plan=batch["plan"].detach().cpu(),
+        )
     
-    # def validation_epoch_end(self, validation_step_outputs):
-    #     outs = {
-    #         k: [dic[k] for dic in validation_step_outputs]
-    #         for k in validation_step_outputs[0]
-    #     }
+    def validation_epoch_end(self, validation_step_outputs):
+        outs = {
+            k: [dic[k] for dic in validation_step_outputs]
+            for k in validation_step_outputs[0]
+        }
+
+        action_logit = torch.cat(outs["action_logit"], dim=0)
+        pred_action = action_logit.softmax(dim=1).argmax(dim=1)
+        action = torch.cat(outs["action"], dim=0)
+        action_acc = (pred_action == action).float().mean().item()
+        self.log("val_action_accuracy", action_acc)
+
+        plan_logit = torch.cat(outs["plan_logit"], dim=0)
+        pred_plan = plan_logit.softmax(dim=2).argmax(dim=2)
+        plan = torch.cat(outs["plan"], dim=0)
+        plan_acc_per_sample = (pred_plan == plan).float().mean(dim=1)
+        plan_acc = plan_acc_per_sample.mean().item()
+        self.log("val_plan_token_accuracy", plan_acc)
 
     def training_step_end(self, training_step_outputs):
         (lr,) = self.scheduler.get_last_lr()
@@ -435,12 +470,12 @@ class LightningModel(pl.LightningModule):
 
 base_path = "/var/scratch/kvu400"
 def main(
-    lr=5e-4,
-    weight_decay=1e-6,
+    lr=3e-4,
+    weight_decay=1e-2,
     warmup_steps=1000,
     gradient_clip_val=0.5,
     num_gpus=1,
-    num_epochs=5,
+    num_epochs=20,
     batch_size=32,
     debug=True,
     train_csv_dir=os.path.join(base_path, "kore/train.csv"),
@@ -515,7 +550,7 @@ def main(
         gradient_clip_val=gradient_clip_val, 
         max_epochs=num_epochs, 
         track_grad_norm=2,
-        enable_progress_bar=True,
+        enable_progress_bar=debug,
         logger=not debug,
         enable_checkpointing=not debug,
         callbacks=callback_list,

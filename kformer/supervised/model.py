@@ -7,25 +7,25 @@ from kformer.supervised.utils import fleet_w2i
 
 
 class TorusConv2d(nn.Module):
-    def __init__(self, input_dim, output_dim, kernel_size, bn):
+    def __init__(self, input_dim, output_dim, kernel_size):
         super().__init__()
         self.edge_size = (kernel_size[0] // 2, kernel_size[1] // 2)
         self.conv = nn.Conv2d(input_dim, output_dim, kernel_size=kernel_size, bias=False)
-        self.bn = nn.BatchNorm2d(output_dim) if bn else None
+        self.bn = nn.BatchNorm2d(output_dim)
 
     def forward(self, x):
         h = torch.cat([x[:,:,:,-self.edge_size[1]:], x, x[:,:,:,:self.edge_size[1]]], dim=3)
         h = torch.cat([h[:,:,-self.edge_size[0]:], h, h[:,:,:self.edge_size[0]]], dim=2)
         h = self.conv(h)
-        h = self.bn(h) if self.bn is not None else h
+        h = self.bn(h)
         return h
 
 
 class SpatialEncoder(nn.Module):
     def __init__(self, input_ch, filters, layers):
         super().__init__()
-        self.conv0 = TorusConv2d(input_ch, filters, (3, 3), bn=True)
-        self.blocks = nn.ModuleList([TorusConv2d(filters, filters, (3, 3), bn=True) for _ in range(layers)])
+        self.conv0 = TorusConv2d(input_ch, filters, (3, 3))
+        self.blocks = nn.ModuleList([TorusConv2d(filters, filters, (3, 3)) for _ in range(layers)])
         self.up_projection = nn.Conv2d(filters, 128, (1, 1), bias=True)
 
         for m in self.modules():
@@ -37,9 +37,12 @@ class SpatialEncoder(nn.Module):
             
     def forward(self, x):
         h = self.conv0(x)
+        
         for block in self.blocks:
             h = h + F.relu_(block(h))
-        return self.up_projection(h)
+        
+        h = self.up_projection(h)
+        return h
 
 
 class ScalarEncoder(nn.Module):
@@ -94,7 +97,7 @@ class FlightPlanFcEncoder(nn.Module):
         super().__init__()
         self.token_embedding = nn.Embedding(18, 128, padding_idx=fleet_w2i["PAD"])
         self.pos_embedding = nn.Embedding(20, 128)
-        self.fc = nn.Linear(128, 128)
+        self.fc = nn.Linear(128, 128) # Do we need this transformation?
         
     def forward(self, fleet_plan, fleet_plan_mask):
         bs, nr_fleet, plan_len = fleet_plan.shape
@@ -109,7 +112,7 @@ class FlightPlanFcEncoder(nn.Module):
         
         inverted_mask = 1 - fleet_plan_mask.long().unsqueeze(3).expand(seq_emb.shape)
         seq_emb = seq_emb * inverted_mask
-        fleet_emb = seq_emb.sum(dim=2)
+        fleet_emb = seq_emb.sum(dim=2) # Bag of words
         return fleet_emb # shape (bs, nr_fleet, 128)
 
 
@@ -120,7 +123,7 @@ class FusionTransformer(nn.Module):
             nn.TransformerEncoderLayer(
                 d_model=128, 
                 nhead=4,
-                dim_feedforward=256,
+                dim_feedforward=1024,
                 activation="gelu",
                 norm_first=True,
             ),
@@ -133,7 +136,7 @@ class FusionTransformer(nn.Module):
             nn.TransformerDecoderLayer(
                 d_model=128, 
                 nhead=4,
-                dim_feedforward=256,
+                dim_feedforward=1024,
                 activation="gelu",
                 norm_first=True,
             ),
@@ -152,7 +155,6 @@ class FusionTransformer(nn.Module):
         self.pos_y = nn.Embedding(22, 64, padding_idx=21)
         self.team_id = nn.Embedding(10, 128)
         self.step = nn.Embedding(400, 128)
-        self.tgt_pos = nn.Embedding(20, 128)
     
     def forward(self, fmap_emb, team_info_emb, team_fleet_emb, opp_info_emb, opp_fleet_emb, x):
         # Replace some tokens with zero vector
@@ -223,7 +225,14 @@ class KoreNet(nn.Module):
         self.fusion_transformer = FusionTransformer()
 
         self.action_head = nn.Linear(128, 3, bias=True)
-        self.cardinality_head = nn.Linear(128, 1, bias=True)
+        self.spawn_nr_head = nn.Sequential(
+            nn.Linear(128, 1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.launch_nr_head = nn.Sequential(
+            nn.Linear(128, 1, bias=True),
+            nn.Sigmoid(), # Do I need sigmoid here?
+        )
         self.plan_head = nn.Linear(128, 18, bias=True)
     
     def forward(self, x):
@@ -261,6 +270,7 @@ class KoreNet(nn.Module):
 
         return dict(
             action_logit=self.action_head(out[:, 0, :]),
-            cardinality_logit=self.cardinality_head(out[:, 0, :]),
+            spawn_nr_logit=self.spawn_nr_head(out[:, 0, :]),
+            launch_nr_logit=self.launch_nr_head(out[:, 0, :]),
             plan_logit=self.plan_head(out[:, 1:, :])
         )
