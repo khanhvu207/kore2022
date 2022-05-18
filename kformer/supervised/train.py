@@ -364,6 +364,8 @@ class LightningModel(pl.LightningModule):
         self.num_samples = num_samples
 
         self.net = KoreNet(debug)
+
+        self.eps = 1e-5
     
     def forward(self, x):
         return self.net(x)
@@ -374,9 +376,9 @@ class LightningModel(pl.LightningModule):
         action_loss = nn.CrossEntropyLoss()(out["action_logit"], batch["action"])
         
         spawn_nr_loss = nn.MSELoss(reduction="none")(out["spawn_nr_logit"], batch["spawn_nr"])
-        spawn_nr_loss = (spawn_nr_loss * batch["is_spawn"]).sum() / batch["is_spawn"].sum()
+        spawn_nr_loss = (spawn_nr_loss * batch["is_spawn"]).sum() / (batch["is_spawn"].sum() + self.eps)
         launch_nr_loss = nn.MSELoss(reduction="none")(out["launch_nr_logit"], batch["launch_nr"])
-        launch_nr_loss = (launch_nr_loss * batch["is_launch"]).sum() / batch["is_launch"].sum()
+        launch_nr_loss = (launch_nr_loss * batch["is_launch"]).sum() / (batch["is_launch"].sum() + self.eps)
         
         pred_plan = out["plan_logit"].permute(0, 2, 1)
         plan_loss = nn.CrossEntropyLoss(reduction="none")(pred_plan, batch["plan"])
@@ -396,9 +398,9 @@ class LightningModel(pl.LightningModule):
         action_loss = nn.CrossEntropyLoss()(out["action_logit"], batch["action"])
         
         spawn_nr_loss = nn.MSELoss(reduction="none")(out["spawn_nr_logit"], batch["spawn_nr"])
-        spawn_nr_loss = (spawn_nr_loss * batch["is_spawn"]).sum() / batch["is_spawn"].sum()
+        spawn_nr_loss = (spawn_nr_loss * batch["is_spawn"]).sum() / (batch["is_spawn"].sum() + self.eps)
         launch_nr_loss = nn.MSELoss(reduction="none")(out["launch_nr_logit"], batch["launch_nr"])
-        launch_nr_loss = (launch_nr_loss * batch["is_launch"]).sum() / batch["is_launch"].sum()
+        launch_nr_loss = (launch_nr_loss * batch["is_launch"]).sum() / (batch["is_launch"].sum() + self.eps)
         
         pred_plan = out["plan_logit"].permute(0, 2, 1)
         plan_loss = nn.CrossEntropyLoss(reduction="none")(pred_plan, batch["plan"])
