@@ -421,6 +421,7 @@ class LightningModel(pl.LightningModule):
             # launch_nr=batch["launch_nr"].detach().cpu(),
             plan_logit=out["plan_logit"].detach().cpu(),
             plan=batch["plan"].detach().cpu(),
+            plan_mask=batch["plan_mask"].detach().cpu(),
         )
     
     def validation_epoch_end(self, validation_step_outputs):
@@ -438,8 +439,10 @@ class LightningModel(pl.LightningModule):
         plan_logit = torch.cat(outs["plan_logit"], dim=0)
         pred_plan = plan_logit.softmax(dim=2).argmax(dim=2)
         plan = torch.cat(outs["plan"], dim=0)
-        plan_acc_per_sample = (pred_plan == plan).float().mean(dim=1)
+        plan_mask = torch.cat(outs["plan_mask"], dim=0)
+        plan_acc_per_sample = ((pred_plan == plan).float() * plan_mask).sum(dim=1) / plan_mask.sum(dim=1)
         plan_acc = plan_acc_per_sample.mean().item()
+        print("Token accuracy", plan_acc)
         self.log("val_plan_token_accuracy", plan_acc)
 
     def training_step_end(self, training_step_outputs):
