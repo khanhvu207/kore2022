@@ -7,25 +7,26 @@ from kformer.supervised.utils import fleet_w2i
 
 
 class TorusConv2d(nn.Module):
-    def __init__(self, input_dim, output_dim, kernel_size):
+    def __init__(self, input_dim, output_dim, kernel_size, bn):
         super().__init__()
         self.edge_size = (kernel_size[0] // 2, kernel_size[1] // 2)
-        self.conv = nn.Conv2d(input_dim, output_dim, kernel_size=kernel_size, bias=False)
+        self.conv = nn.Conv2d(input_dim, output_dim, kernel_size=kernel_size)
         self.bn = nn.BatchNorm2d(output_dim)
 
     def forward(self, x):
         h = torch.cat([x[:,:,:,-self.edge_size[1]:], x, x[:,:,:,:self.edge_size[1]]], dim=3)
         h = torch.cat([h[:,:,-self.edge_size[0]:], h, h[:,:,:self.edge_size[0]]], dim=2)
         h = self.conv(h)
-        h = self.bn(h)
+        if self.bn is True:
+            h = self.bn(h)
         return h
 
 
 class SpatialEncoder(nn.Module):
     def __init__(self, input_ch, filters, layers):
         super().__init__()
-        self.conv0 = TorusConv2d(input_ch, filters, (3, 3))
-        self.blocks = nn.ModuleList([TorusConv2d(filters, filters, (3, 3)) for _ in range(layers)])
+        self.conv0 = TorusConv2d(input_ch, filters, (3, 3), bn=False)
+        self.blocks = nn.ModuleList([TorusConv2d(filters, filters, (3, 3), bn=False) for _ in range(layers)])
         self.up_projection = nn.Conv2d(filters, 128, (1, 1), bias=True)
 
         for m in self.modules():
@@ -50,7 +51,7 @@ class ScalarEncoder(nn.Module):
         super().__init__()
         self.fc = nn.Sequential(
             nn.Linear(input_dim, 256),
-            nn.BatchNorm1d(256),
+            # nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Linear(256, output_dim),
         )
@@ -224,7 +225,7 @@ class KoreNet(nn.Module):
         self.flight_plan_encoder = FlightPlanFcEncoder()
         self.fusion_transformer = FusionTransformer()
 
-        self.action_head = nn.Linear(128, 3, bias=True)
+        self.action_head = nn.Linear(128, 3, bias=True) # bias=False can possibly work even better
         self.spawn_nr_head = nn.Sequential(
             nn.Linear(128, 1, bias=True),
             nn.Sigmoid(),
