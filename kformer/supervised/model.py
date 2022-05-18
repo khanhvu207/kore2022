@@ -124,25 +124,25 @@ class FusionTransformer(nn.Module):
             nn.TransformerEncoderLayer(
                 d_model=128, 
                 nhead=4,
-                dim_feedforward=1024,
+                dim_feedforward=256,
                 activation="gelu",
                 norm_first=True,
             ),
             num_layers=6,
         )
-
-        self.ln = nn.LayerNorm(128)
-        
         self.decoder = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
                 d_model=128, 
                 nhead=4,
-                dim_feedforward=1024,
+                dim_feedforward=256,
                 activation="gelu",
                 norm_first=True,
             ),
             num_layers=3,
         )
+        self.src_ln = nn.LayerNorm(128)
+        self.tgt_ln = nn.LayerNorm(128)
+
         self.sep_token = nn.Parameter(nn.init.normal_(torch.empty(1, 128)))
         self.tgt_token = nn.Parameter(nn.init.normal_(torch.empty(20, 128)))
         
@@ -190,7 +190,7 @@ class FusionTransformer(nn.Module):
             ], 
             dim=1
         )
-        seq = self.ln(seq) # Apply LayerNorm to all input tokens
+        seq = self.src_ln(seq) # Apply LayerNorm to all input tokens
         
         team_fleet_mask = x["team_fleet_mask"]
         opp_fleet_mask = x["opp_fleet_mask"]
@@ -207,8 +207,9 @@ class FusionTransformer(nn.Module):
 
         tgt_seq = self.tgt_token.expand((bs, 20, 128))
         tgt_seq = tgt_seq + self.team_id(x["team_id"]).expand((-1, 20, -1)) + self.step(x["step"]).expand((-1, 20, -1))
-        tgt_seq = tgt_seq.permute(1, 0, 2)
+        tgt_seq = self.tgt_ln(tgt_seq) # Apply LayerNorm to all tgt tokens
         
+        tgt_seq = tgt_seq.permute(1, 0, 2)
         out = self.decoder(tgt=tgt_seq, memory=memory, memory_key_padding_mask=seq_mask)
         return out.permute(1, 0, 2)
     
@@ -225,11 +226,8 @@ class KoreNet(nn.Module):
         self.flight_plan_encoder = FlightPlanFcEncoder()
         self.fusion_transformer = FusionTransformer()
 
-        self.action_head = nn.Linear(128, 3, bias=True) # bias=False can possibly work even better
-        self.spawn_nr_head = nn.Sequential(
-            nn.Linear(128, 1, bias=True),
-            nn.Sigmoid(),
-        )
+        self.action_head = nn.Linear(128, 3, bias=False) # bias=False can possibly work even better
+        self.spawn_nr_head = nn.Linear(128, 11, bias=True)
         self.launch_nr_head = nn.Sequential(
             nn.Linear(128, 1, bias=True),
             nn.Sigmoid(), # Do I need sigmoid here?

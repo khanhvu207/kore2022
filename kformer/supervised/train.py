@@ -111,7 +111,7 @@ class KoreDataset(Dataset):
         return torch.vstack([kore, shipyard, shipyard_num_ship, shipyard_max_spawn, fleet, fleet_cargo])
     
     def _tokenize_fleet_plan(self, plan, max_len):
-        tokens = ["CLS"] + list(plan) + ["PAD"] * (max_len - len(plan) + 1)
+        tokens = list(plan) + ["EOS"] + ["PAD"] * (max_len - len(plan) + 1)
         mask = [False] * (1 + len(plan)) + [True] * (max_len - len(plan) + 1)
         return list(map(fleet_w2i.get, tokens)), mask
     
@@ -178,8 +178,8 @@ class KoreDataset(Dataset):
         shipyard_turn_controlled = row["ShipyardTurnControlled"]
         
         action = action_encoder[row["Action"]]
-        spawn_nr = int(row["Spawn_nr"]) / 10
-        launch_nr = int(row["Launch_nr"]) / 100
+        spawn_nr = int(row["Spawn_nr"]) # Multi-class prediction target
+        launch_nr = int(row["Launch_nr"]) / 149 # Regression target
         is_spawn = row["Action"] == "SPAWN"
         is_launch = row["Action"] == "LAUNCH"
         
@@ -279,7 +279,7 @@ def CustomCollateFn(batch):
     batch_shipyard_turn_controlled = torch.tensor([x["shipyard_turn_controlled"] for x in batch], dtype=torch.long).unsqueeze(1)
     batch_action = torch.tensor([x["action"] for x in batch], dtype=torch.long)
     
-    batch_spawn_nr = torch.tensor([x["spawn_nr"] for x in batch], dtype=torch.float).unsqueeze(1)
+    batch_spawn_nr = torch.tensor([x["spawn_nr"] for x in batch], dtype=torch.long)
     batch_launch_nr = torch.tensor([x["launch_nr"] for x in batch], dtype=torch.float).unsqueeze(1)
     batch_is_spawn = torch.tensor([x["is_spawn"] for x in batch], dtype=torch.long).unsqueeze(1)
     batch_is_launch = torch.tensor([x["is_launch"] for x in batch], dtype=torch.long).unsqueeze(1)
@@ -362,10 +362,11 @@ class LightningModel(pl.LightningModule):
         self.num_epochs = num_epochs
         self.num_gpus = num_gpus
         self.num_samples = num_samples
+        self.debug = debug
 
         self.net = KoreNet(debug)
 
-        self.eps = 1e-5
+        self.eps = 1e-7
     
     def forward(self, x):
         return self.net(x)
@@ -375,8 +376,9 @@ class LightningModel(pl.LightningModule):
         
         action_loss = nn.CrossEntropyLoss()(out["action_logit"], batch["action"])
         
-        spawn_nr_loss = nn.MSELoss(reduction="none")(out["spawn_nr_logit"], batch["spawn_nr"])
+        spawn_nr_loss = nn.CrossEntropyLoss(reduction="none")(out["spawn_nr_logit"], batch["spawn_nr"])
         spawn_nr_loss = (spawn_nr_loss * batch["is_spawn"]).sum() / (batch["is_spawn"].sum() + self.eps)
+
         launch_nr_loss = nn.MSELoss(reduction="none")(out["launch_nr_logit"], batch["launch_nr"])
         launch_nr_loss = (launch_nr_loss * batch["is_launch"]).sum() / (batch["is_launch"].sum() + self.eps)
         
@@ -385,11 +387,12 @@ class LightningModel(pl.LightningModule):
         plan_loss = (plan_loss * batch["plan_mask"]).sum() / batch["plan_mask"].sum()
 
         loss = action_loss + spawn_nr_loss + launch_nr_loss + plan_loss
-        self.log("train_loss", loss)
-        self.log("train_action_loss", action_loss)
-        self.log("train_spawn_nr_loss", spawn_nr_loss)
-        self.log("train_launch_nr_loss", launch_nr_loss)
-        self.log("train_plan_loss", plan_loss)
+
+        self.log("train/loss", loss)
+        self.log("train/action_loss", action_loss)
+        self.log("train/spawn_nr_loss", spawn_nr_loss)
+        self.log("train/launch_nr_loss", launch_nr_loss)
+        self.log("train/plan_loss", plan_loss)
         return loss
     
     def validation_step(self, batch, batch_idx):
@@ -397,8 +400,9 @@ class LightningModel(pl.LightningModule):
         
         action_loss = nn.CrossEntropyLoss()(out["action_logit"], batch["action"])
         
-        spawn_nr_loss = nn.MSELoss(reduction="none")(out["spawn_nr_logit"], batch["spawn_nr"])
+        spawn_nr_loss = nn.CrossEntropyLoss(reduction="none")(out["spawn_nr_logit"], batch["spawn_nr"])
         spawn_nr_loss = (spawn_nr_loss * batch["is_spawn"]).sum() / (batch["is_spawn"].sum() + self.eps)
+
         launch_nr_loss = nn.MSELoss(reduction="none")(out["launch_nr_logit"], batch["launch_nr"])
         launch_nr_loss = (launch_nr_loss * batch["is_launch"]).sum() / (batch["is_launch"].sum() + self.eps)
         
@@ -407,21 +411,21 @@ class LightningModel(pl.LightningModule):
         plan_loss = (plan_loss * batch["plan_mask"]).sum() / batch["plan_mask"].sum()
 
         loss = action_loss + spawn_nr_loss + launch_nr_loss + plan_loss
-        self.log("val_loss", loss)
-        self.log("val_action_loss", action_loss)
-        self.log("val_spawn_nr_loss", spawn_nr_loss)
-        self.log("val_launch_nr_loss", launch_nr_loss)
-        self.log("val_plan_loss", plan_loss)
+
+        self.log("val/loss", loss)
+        self.log("val/action_loss", action_loss)
+        self.log("val/spawn_nr_loss", spawn_nr_loss)
+        self.log("val/launch_nr_loss", launch_nr_loss)
+        self.log("val/plan_loss", plan_loss)
         return dict(
             action_logit=out["action_logit"].detach().cpu(),
             action=batch["action"].detach().cpu(),
-            # spawn_nr_logit=out["spawn_nr_logit"].detach().cpu(),
-            # spawn_nr=batch["spawn_nr"].detach().cpu(),
-            # launch_nr_logit=out["launch_nr_logit"].detach().cpu(),
-            # launch_nr=batch["launch_nr"].detach().cpu(),
+            spawn_nr_logit=out["spawn_nr_logit"].detach().cpu(),
+            spawn_nr=batch["spawn_nr"].detach().cpu(),
             plan_logit=out["plan_logit"].detach().cpu(),
             plan=batch["plan"].detach().cpu(),
             plan_mask=batch["plan_mask"].detach().cpu(),
+            is_launch=batch["is_launch"].detach().cpu(),
         )
     
     def validation_epoch_end(self, validation_step_outputs):
@@ -434,16 +438,50 @@ class LightningModel(pl.LightningModule):
         pred_action = action_logit.softmax(dim=1).argmax(dim=1)
         action = torch.cat(outs["action"], dim=0)
         action_acc = (pred_action == action).float().mean().item()
-        self.log("val_action_accuracy", action_acc)
+        self.log("val/action_accuracy", action_acc)
+
+        pred_action = pred_action.numpy().tolist()
+        action = action.numpy().tolist()
+        action_label = ["IDLE", "SPAWN", "LAUNCH"]
+        for x in range(3):
+            tp = 0
+            pred_count = 0
+            true_count = 0
+            
+            for i in range(len(pred_action)):
+                pred_count += pred_action[i] == x
+                true_count += action[i] == x
+                if pred_action[i] == x:
+                    tp += pred_action[i] == action[i]
+            
+            precision = tp / (pred_count + self.eps)
+            recall = tp / (true_count + self.eps)
+            
+            if self.debug:
+                print(action_label[x], f"precision={precision}, recall={recall}")
+
+            self.log(f"val/{action_label[x]}_precision", precision)
+            self.log(f"val/{action_label[x]}_recall", recall) 
+
+        spawn_nr_logit = torch.cat(outs["spawn_nr_logit"], dim=0)
+        pred_spawn_nr = spawn_nr_logit.softmax(dim=1).argmax(dim=1)
+        spawn_nr = torch.cat(outs["spawn_nr"], dim=0)
+        spawn_nr_acc = (pred_spawn_nr == spawn_nr).float().mean().item()
+        self.log("val/spawn_nr_accuracy", spawn_nr_acc)
 
         plan_logit = torch.cat(outs["plan_logit"], dim=0)
         pred_plan = plan_logit.softmax(dim=2).argmax(dim=2)
         plan = torch.cat(outs["plan"], dim=0)
         plan_mask = torch.cat(outs["plan_mask"], dim=0)
+        is_launch = torch.cat(outs["is_launch"], dim=0).squeeze(1)
         plan_acc_per_sample = ((pred_plan == plan).float() * plan_mask).sum(dim=1) / plan_mask.sum(dim=1)
-        plan_acc = plan_acc_per_sample.mean().item()
-        print("Token accuracy", plan_acc)
-        self.log("val_plan_token_accuracy", plan_acc)
+        plan_acc = ((plan_acc_per_sample * is_launch).sum() / is_launch.sum()).item()
+        self.log("val/plan_token_accuracy", plan_acc)
+
+        if self.debug:
+            print("Action accuracy", action_acc)
+            print("Spawn_nr accuracy", spawn_nr_acc)
+            print("Plan token accuracy", plan_acc)
 
     def training_step_end(self, training_step_outputs):
         (lr,) = self.scheduler.get_last_lr()
