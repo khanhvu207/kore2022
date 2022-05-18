@@ -18,3 +18,10 @@ I know this is the case by observing the losses and accuracies:
 - Bad hyperparameters:
   - Learning rate was too large/too small
   - Weight decay is too large?
+
+## May 18, 2022 (Evening session)
+Removing **BatchNorm2d** in the SpatialEncoder resolved the problem mentioned above. Perhaps batch normalization does not work well in case of sparse/special domain inputs. Normalization will destroy crucial information.
+
+I converted the **spawn_nr_head** into a multiclass classification because there are only ten possible outcomes.
+
+Tracking precision and recall for **action** prediction is useful due to class imbalance; for instance, 66% of the classes is LAUNCH, so the model would just predict this majority class and achieve 66% action accuracy. Furthermore, I removed bias of the **action_head** layer.
