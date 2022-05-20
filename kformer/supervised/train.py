@@ -2,6 +2,7 @@ import os
 import json
 import copy
 import fire
+import pickle
 import datetime
 import numpy as np
 import pandas as pd
@@ -9,6 +10,7 @@ import pandas as pd
 from tqdm.auto import tqdm
 from collections import defaultdict
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
 
 import torch
 import torch.nn as nn
@@ -20,314 +22,323 @@ from torch.utils.data import Dataset, DataLoader
 import datasets
 from transformers import get_cosine_schedule_with_warmup
 
+from kformer.supervised.model import KoreNet
 from kformer.supervised.utils import Timer, profile
-from kformer.supervised.utils import fleet_w2i, shipyard_w2i, shipyard_i2w, fleet_dir
+from kformer.supervised.utils import fleet_w2i, shipyard_w2i, shipyard_i2w, fleet_dir, action_encoder
 
 
-class KoreTensorDataset(Dataset):
-    def __init__(self, data, data_path):
+class KoreDataset(Dataset):
+    def __init__(self, df, ep, debug=False):
         super().__init__()
-        self.df = data
-        self.data_path = data_path
-        self.row_indicies = self.df.index
+        self.df = df
+        self.indicies = self.df.index
+        self.ep = ep
+        self.debug = debug
+        self.team_le = LabelEncoder().fit(self.df["TeamName"])
     
     def __len__(self):
         return len(self.df)
     
+    def get_obs_at_step(self, ep_id, step):
+        obs = self.ep[ep_id]["steps"][step][0]["observation"]
+        return obs
+    
+    def _normalize(self, x, low=-1.0, high=1.0, eps=1e-5) -> torch.tensor:
+        return (high - low) * (x - x.min()) / (x.max() + eps) + low
+    
+    def _standardize(self, x, eps=1e-5) -> torch.tensor:
+        return (x - x.mean()) / (x.std() + eps)
+    
+    def get_feature_map(self, obs, player):
+        kore = torch.tensor(obs["kore"], dtype=torch.float).view(1, 21, 21)
+        
+        team_shipyard = torch.zeros((1, 21, 21))
+        team_shipyard_num_ship = torch.zeros((1, 21, 21))
+        team_shipyard_max_spawn = torch.zeros((1, 21, 21))
+        team_fleet = torch.zeros((1, 21, 21))
+        team_fleet_cargo = torch.zeros((1, 21, 21))
+        
+        for shipyard_id, info in obs["players"][player][1].items():
+            pos, num_ship, turn_controlled = info
+            pos_x = pos // 21
+            pos_y = pos % 21
+            team_shipyard[0, pos_x, pos_y] = 1
+            team_shipyard_num_ship[0, pos_x, pos_y] = num_ship
+            team_shipyard_max_spawn[0, pos_x, pos_y] = int(np.log2(max(turn_controlled, 2)-1))+1
+            
+        for fleet_id, info in obs["players"][player][2].items():
+            pos, fleet_kore, fleet_size, direction, plan = info
+            pos_x = pos // 21
+            pos_y = pos % 21
+            team_fleet[0, pos_x, pos_y] = fleet_size
+            team_fleet_cargo[0, pos_x, pos_y] = fleet_kore
+            
+        opponent = 1 - player
+        opp_shipyard = torch.zeros((1, 21, 21))
+        opp_shipyard_num_ship = torch.zeros((1, 21, 21))
+        opp_shipyard_max_spawn = torch.zeros((1, 21, 21))
+        opp_fleet = torch.zeros((1, 21, 21))
+        opp_fleet_cargo = torch.zeros((1, 21, 21))
+        
+        for shipyard_id, info in obs["players"][opponent][1].items():
+            pos, num_ship, turn_controlled = info
+            pos_x = pos // 21
+            pos_y = pos % 21
+            opp_shipyard[0, pos_x, pos_y] = 1
+            opp_shipyard_num_ship[0, pos_x, pos_y] = num_ship
+            opp_shipyard_max_spawn[0, pos_x, pos_y] = int(np.log2(max(turn_controlled, 2)-1))+1
+        
+        for fleet_id, info in obs["players"][opponent][2].items():
+            pos, fleet_kore, fleet_size, direction, plan = info
+            pos_x = pos // 21
+            pos_y = pos % 21
+            opp_fleet[0, pos_x, pos_y] = fleet_size
+            opp_fleet_cargo[0, pos_x, pos_y] = fleet_kore
+            
+        shipyard = torch.vstack([team_shipyard, opp_shipyard])
+        shipyard_num_ship = torch.vstack([team_shipyard_num_ship, opp_shipyard_num_ship])
+        shipyard_max_spawn = torch.vstack([team_shipyard_max_spawn, opp_shipyard_max_spawn])
+        fleet = torch.vstack([team_fleet, opp_fleet])
+        fleet_cargo = torch.vstack([team_fleet_cargo, opp_fleet_cargo])
+        
+        cur_max_kore = kore.max()
+        kore = self._normalize(kore / 500).float()
+        shipyard = self._normalize(shipyard).float()
+        shipyard_num_ship = self._normalize(shipyard_num_ship / 1000).float()
+        shipyard_max_spawn = self._normalize(shipyard_max_spawn / 10).float()
+        fleet = self._normalize(fleet / 1000).float()
+        fleet_cargo = self._normalize(fleet_cargo / cur_max_kore).float()
+        return torch.vstack([kore, shipyard, shipyard_num_ship, shipyard_max_spawn, fleet, fleet_cargo])
+    
+    def _tokenize_fleet_plan(self, plan, max_len):
+        tokens = list(plan) + ["EOS"] + ["PAD"] * (max_len - len(plan) + 1)
+        mask = [False] * (1 + len(plan)) + [True] * (max_len - len(plan) + 1)
+        return list(map(fleet_w2i.get, tokens)), mask
+    
+    def get_fleet_info(self, obs, player):
+        team_fleet_pos = [(21, 21)] # Prepend a ghost fleet to avoid some exceptions...
+        team_fleet_plan = ["N"]
+        team_plan_max_len = 0
+        for fleet_id, info in obs["players"][player][2].items():
+            pos, fleet_kore, fleet_size, direction, plan = info
+            plan = fleet_dir[direction] if len(plan) == 0 else plan
+            pos_x = pos // 21
+            pos_y = pos % 21
+            team_fleet_pos.append((pos_x, pos_y))
+            team_fleet_plan.append(plan)
+            team_plan_max_len = max(team_plan_max_len, len(plan))
+        
+        opponent = 1 - player
+        opp_fleet_pos = [(21, 21)]
+        opp_fleet_plan = ["N"]
+        opp_plan_max_len = 0
+        for fleet_id, info in obs["players"][opponent][2].items():
+            pos, fleet_kore, fleet_size, direction, plan = info
+            plan = fleet_dir[direction] if len(plan) == 0 else plan
+            pos_x = pos // 21
+            pos_y = pos % 21
+            opp_fleet_pos.append((pos_x, pos_y))
+            opp_fleet_plan.append(plan)
+            opp_plan_max_len = max(opp_plan_max_len, len(plan))
+        
+        team_fleet = list(map(lambda f: self._tokenize_fleet_plan(f, team_plan_max_len), team_fleet_plan))
+        opp_fleet = list(map(lambda f: self._tokenize_fleet_plan(f, opp_plan_max_len), opp_fleet_plan))
+        return team_fleet, team_fleet_pos, opp_fleet, opp_fleet_pos
+    
     def __getitem__(self, i):
-        row_index = self.row_indicies[i]
-        row = self.df.loc[row_index]
-        data = np.load(os.path.join(self.data_path, f"{row_index}.npz"), allow_pickle=True)
-        data = data["arr_0"].item()
-        return data
+        profiler = Timer()
+        
+        idx = self.indicies[i]
+        row = self.df.loc[idx]
+        player = row["Player"]
+        step = row["Step"]
+        ep_id = str(row["EpisodeId"])
+        profile(profiler, "initialize", self.debug)
+        
+        obs = self.get_obs_at_step(ep_id, step)
+        fmap = self.get_feature_map(obs, player)
+        profile(profiler, "get_feature_map", self.debug)
+        
+        team_fleet, team_fleet_pos, opp_fleet, opp_fleet_pos = self.get_fleet_info(obs, player)
+        team_fleet_plan, team_fleet_plan_mask = map(list, zip(*team_fleet))
+        opp_fleet_plan, opp_fleet_plan_mask = map(list, zip(*opp_fleet))
+        team_fleet_plan = torch.tensor(team_fleet_plan, dtype=torch.long)
+        team_fleet_plan_mask = torch.tensor(team_fleet_plan_mask, dtype=torch.bool)
+        opp_fleet_plan = torch.tensor(opp_fleet_plan, dtype=torch.long)
+        opp_fleet_plan_mask = torch.tensor(opp_fleet_plan_mask, dtype=torch.bool)
+        profile(profiler, "get_fleet_info", self.debug)
+        
+        player_kore = obs["players"][player][0] / 100000
+        opp_kore = obs["players"][1-player][0] / 100000
+        team_id = self.team_le.transform([row["TeamName"]]).item()
+
+        shipyard_pos_x = row["ShipyardPosX"]
+        shipyard_pos_y = row["ShipyardPosY"]
+        shipyard_nr_ship = int(row["ShipyardNrShip"]) / 500
+        shipyard_turn_controlled = row["ShipyardTurnControlled"]
+        
+        action = action_encoder[row["Action"]]
+        spawn_nr = int(row["Spawn_nr"]) # Multi-class prediction target
+        launch_nr = int(row["Launch_nr"]) / 149 # Regression target
+        is_spawn = row["Action"] == "SPAWN"
+        is_launch = row["Action"] == "LAUNCH"
+        
+        plan = list(str(row["Plan"]) if str(row["Plan"]) != "nan" else "") + ["EOS"]
+        plan = torch.tensor(list(map(shipyard_w2i.get, plan)), dtype=torch.long)
+        profile(profiler, "finalizing", self.debug)
+        
+        return dict(
+            step=step,
+            team_id=team_id,
+            fmap=fmap,
+            team_kore=player_kore,
+            team_fleet_pos=team_fleet_pos,
+            team_fleet_plan=team_fleet_plan,
+            team_fleet_plan_mask=team_fleet_plan_mask,
+            opp_kore=opp_kore,
+            opp_fleet_pos=opp_fleet_pos,
+            opp_fleet_plan=opp_fleet_plan,
+            opp_fleet_plan_mask=opp_fleet_plan_mask,
+            shipyard_pos_x=shipyard_pos_x,
+            shipyard_pos_y=shipyard_pos_y,
+            shipyard_nr_ship=shipyard_nr_ship,
+            shipyard_turn_controlled=shipyard_turn_controlled,
+            action=action,
+            spawn_nr=spawn_nr,
+            launch_nr=launch_nr,
+            is_spawn=is_spawn,
+            is_launch=is_launch,
+            plan=plan,
+        )
 
 
 def CustomCollateFn(batch):
-    batch_fmap = torch.vstack([x["fmap"].unsqueeze(0) for x in batch])
-    batch_global_info = torch.vstack([x["global_info"].unsqueeze(0) for x in batch])
-    batch_team_id = torch.vstack([x["team_id"].unsqueeze(0) for x in batch])
-    batch_ship_pos_x = torch.tensor([x["ship_pos_x"] for x in batch]).long()
-    batch_ship_pos_y = torch.tensor([x["ship_pos_y"] for x in batch]).long()
-    max_team_fleet_len = max([len(x["team_fleet_pos"]) for x in batch])
-    max_opp_fleet_len = max([len(x["opp_fleet_pos"]) for x in batch])
+    batch_size = len(batch)
     
-    def pad(a, value, l):
-        a.extend([value] * l)
-        return a
+    batch_step = torch.tensor([x["step"] for x in batch], dtype=torch.long).unsqueeze(1) # shape (bs, 1)
+    batch_team_id = torch.tensor([x["team_id"] for x in batch], dtype=torch.long).unsqueeze(1)  # shape (bs, 1)
+    batch_fmap = torch.vstack([x["fmap"].unsqueeze(0) for x in batch]) # shape (bs, ch, 21, 21)
     
-    batch_team_fleet_pos_x = [[pos_x for pos_x, pos_y in x["team_fleet_pos"]] for x in batch]
-    batch_team_fleet_pos_x = [pad(a, 21, max_team_fleet_len-len(a)) for a in batch_team_fleet_pos_x]
-    batch_team_fleet_pos_x = torch.tensor(batch_team_fleet_pos_x).long()
-    batch_team_fleet_pos_y = [[pos_y for pos_x, pos_y in x["team_fleet_pos"]] for x in batch]
-    batch_team_fleet_pos_y = [pad(a, 21, max_team_fleet_len-len(a)) for a in batch_team_fleet_pos_y]
-    batch_team_fleet_pos_y = torch.tensor(batch_team_fleet_pos_y).long()
-    batch_opp_fleet_pos_x = [[pos_x for pos_x, pos_y in x["opp_fleet_pos"]] for x in batch]
-    batch_opp_fleet_pos_x = [pad(a, 21, max_opp_fleet_len-len(a)) for a in batch_opp_fleet_pos_x]
-    batch_opp_fleet_pos_x = torch.tensor(batch_opp_fleet_pos_x).long()
-    batch_opp_fleet_pos_y = [[pos_y for pos_x, pos_y in x["opp_fleet_pos"]] for x in batch]
-    batch_opp_fleet_pos_y = [pad(a, 21, max_opp_fleet_len-len(a)) for a in batch_opp_fleet_pos_y]
-    batch_opp_fleet_pos_y = torch.tensor(batch_opp_fleet_pos_y).long()
+    team_fleet_plans = [x["team_fleet_plan"] for x in batch]
+    team_fleet_masks = [x["team_fleet_plan_mask"] for x in batch]
+    team_max_fleet_size = max([x.shape[0] for x in team_fleet_plans])
+    team_max_fleet_plan = max([x.shape[1] for x in team_fleet_plans])
+    batch_team_fleet_mask = torch.ones((batch_size, team_max_fleet_size), dtype=torch.bool)
+    batch_team_fleet_plan = torch.full((batch_size, team_max_fleet_size, team_max_fleet_plan), fleet_w2i["PAD"], dtype=torch.long)
+    batch_team_fleet_plan_mask = torch.ones((batch_size, team_max_fleet_size, team_max_fleet_plan), dtype=torch.bool)
+    for batch_idx, (fleet_plans, fleet_masks) in enumerate(zip(team_fleet_plans, team_fleet_masks)):
+        nr_fleet = fleet_plans.shape[0]
+        plan_size = fleet_plans.shape[1]
+        batch_team_fleet_mask[batch_idx, 1:nr_fleet] = False # Ignore the dummy fleet
+        batch_team_fleet_plan[batch_idx, :nr_fleet, :plan_size].copy_(fleet_plans)
+        batch_team_fleet_plan_mask[batch_idx, :nr_fleet, :plan_size].copy_(fleet_masks)
     
-    def pad_embedding(a, value, l):
-        if l == 0:
-            return a
-        return torch.cat([a, value.expand(l, value.shape[1])])
+    batch_team_fleet_plan[:, :, 0] = fleet_w2i["CLS"]
+    batch_team_fleet_plan_mask[:, :, 0] = False
+    batch_team_kore = torch.tensor([x["team_kore"] for x in batch], dtype=torch.float).unsqueeze(1)
     
-    batch_team_fleet_emb = [x["team_fleet_emb"] if x["team_fleet_emb"] is not None else torch.zeros((max_team_fleet_len, 288)) for x in batch]
-    batch_team_fleet_emb = [pad_embedding(a, torch.zeros((1, a.shape[1])), max_team_fleet_len-a.shape[0]) for a in batch_team_fleet_emb]
-    batch_team_fleet_emb = torch.vstack([a.unsqueeze(0) for a in batch_team_fleet_emb])
-    batch_opp_fleet_emb = [x["opp_fleet_emb"] if x["opp_fleet_emb"] is not None else torch.zeros((max_opp_fleet_len, 288)) for x in batch]
-    batch_opp_fleet_emb = [pad_embedding(a, torch.zeros((1, a.shape[1])), max_opp_fleet_len-a.shape[0]) for a in batch_opp_fleet_emb]
-    batch_opp_fleet_emb = torch.vstack([a.unsqueeze(0) for a in batch_opp_fleet_emb])
+    team_fleet_pos = [x["team_fleet_pos"] for x in batch]
+    team_fleet_pos_x = [torch.tensor([x for x, y in pos]) for pos in team_fleet_pos]
+    team_fleet_pos_y = [torch.tensor([y for x, y in pos]) for pos in team_fleet_pos]
+    batch_team_fleet_pos_x = torch.full((batch_size, team_max_fleet_size), 21, dtype=torch.long)
+    batch_team_fleet_pos_y = torch.full((batch_size, team_max_fleet_size), 21, dtype=torch.long)
+    for batch_idx, (pos_x, pos_y) in enumerate(zip(team_fleet_pos_x, team_fleet_pos_y)):
+        batch_team_fleet_pos_x[batch_idx, :pos_x.shape[0]].copy_(pos_x)
+        batch_team_fleet_pos_y[batch_idx, :pos_y.shape[0]].copy_(pos_y)
     
-    # ATTENTION!
-    # Pad = True, not-pad = False
-    batch_team_fleet_mask = torch.tensor([[True] * max_team_fleet_len] * len(batch)).bool()
-    for i in range(len(batch)):
-        batch_team_fleet_mask[i, :len(batch[i]["team_fleet_pos"])] = False
+    opp_fleet_plans = [x["opp_fleet_plan"] for x in batch]
+    opp_fleet_masks = [x["opp_fleet_plan_mask"] for x in batch]
+    opp_max_fleet_size = max([x.shape[0] for x in opp_fleet_plans])
+    opp_max_fleet_plan = max([x.shape[1] for x in opp_fleet_plans])
+    batch_opp_fleet_mask = torch.ones((batch_size, opp_max_fleet_size), dtype=torch.bool)
+    batch_opp_fleet_plan = torch.full((batch_size, opp_max_fleet_size, opp_max_fleet_plan), fleet_w2i["PAD"], dtype=torch.long)
+    batch_opp_fleet_plan_mask = torch.ones((batch_size, opp_max_fleet_size, opp_max_fleet_plan), dtype=torch.bool)
+    for batch_idx, (fleet_plans, fleet_masks) in enumerate(zip(opp_fleet_plans, opp_fleet_masks)):
+        nr_fleet = fleet_plans.shape[0]
+        plan_size = fleet_plans.shape[1]
+        batch_opp_fleet_mask[batch_idx, 1:nr_fleet] = False
+        batch_opp_fleet_plan[batch_idx, :nr_fleet, :plan_size].copy_(fleet_plans)
+        batch_opp_fleet_plan_mask[batch_idx, :nr_fleet, :plan_size].copy_(fleet_masks)
     
-    batch_opp_fleet_mask = torch.tensor([[True] * max_opp_fleet_len] * len(batch)).bool()
-    for i in range(len(batch)):
-        batch_opp_fleet_mask[i, :len(batch[i]["opp_fleet_pos"])] = False
+    batch_opp_fleet_plan[:, :, 0] = fleet_w2i["CLS"]
+    batch_opp_fleet_plan_mask[:, :, 0] = False
+    batch_opp_kore = torch.tensor([x["opp_kore"] for x in batch], dtype=torch.float).unsqueeze(1)
     
-    # max_action_len = max([len(x["action"]) for x in batch])
-    max_action_len = 20
-    batch_action_mask = torch.tensor([[True] * max_action_len] * len(batch)).bool()
-    for i in range(len(batch)):
-        batch_action_mask[i, :len(batch[i]["action"])] = False
-        
-    batch_action = [x["action"] for x in batch]
-    batch_action = [pad(a, shipyard_w2i["PAD"], max_action_len-len(a)) for a in batch_action]
-    batch_action = torch.tensor(batch_action).long() 
+    opp_fleet_pos = [x["opp_fleet_pos"] for x in batch]
+    opp_fleet_pos_x = [torch.tensor([x for x, y in pos]) for pos in opp_fleet_pos]
+    opp_fleet_pos_y = [torch.tensor([y for x, y in pos]) for pos in opp_fleet_pos]
+    batch_opp_fleet_pos_x = torch.full((batch_size, opp_max_fleet_size), 21, dtype=torch.long)
+    batch_opp_fleet_pos_y = torch.full((batch_size, opp_max_fleet_size), 21, dtype=torch.long)
+    for batch_idx, (pos_x, pos_y) in enumerate(zip(opp_fleet_pos_x, opp_fleet_pos_y)):
+        batch_opp_fleet_pos_x[batch_idx, :pos_x.shape[0]].copy_(pos_x)
+        batch_opp_fleet_pos_y[batch_idx, :pos_y.shape[0]].copy_(pos_y)
+    
+    batch_shipyard_pos_x = torch.tensor([x["shipyard_pos_x"] for x in batch], dtype=torch.long).unsqueeze(1)
+    batch_shipyard_pos_y = torch.tensor([x["shipyard_pos_y"] for x in batch], dtype=torch.long).unsqueeze(1)
+    batch_shipyard_nr_ship = torch.tensor([x["shipyard_nr_ship"] for x in batch], dtype=torch.float).unsqueeze(1)
+    batch_shipyard_turn_controlled = torch.tensor([x["shipyard_turn_controlled"] for x in batch], dtype=torch.long).unsqueeze(1)
+    batch_action = torch.tensor([x["action"] for x in batch], dtype=torch.long)
+    
+    batch_spawn_nr = torch.tensor([x["spawn_nr"] for x in batch], dtype=torch.long)
+    batch_launch_nr = torch.tensor([x["launch_nr"] for x in batch], dtype=torch.float).unsqueeze(1)
+    batch_is_spawn = torch.tensor([x["is_spawn"] for x in batch], dtype=torch.long).unsqueeze(1)
+    batch_is_launch = torch.tensor([x["is_launch"] for x in batch], dtype=torch.long).unsqueeze(1)
+
+    plans = [x["plan"] for x in batch]
+    max_plan_len = 19 # max([plan.shape[0] for plan in plans])
+    batch_plan = torch.full((batch_size, max_plan_len), shipyard_w2i["PAD"], dtype=torch.long)
+    batch_plan_mask = torch.zeros((batch_size, max_plan_len), dtype=torch.long)
+    for batch_idx, plan in enumerate(plans):
+        plan_len = plan.shape[0]
+        batch_plan[batch_idx, :plan_len].copy_(plan)
+        batch_plan_mask[batch_idx, :plan_len] = 1
+    
+    # Sanity check
+    # assert batch_step.shape == (batch_size, 1)
+    # assert batch_team_id.shape == (batch_size, 1)
+    # assert batch_fmap.shape == (batch_size, 11, 21, 21)
+    # assert batch_team_fleet_mask.shape == (batch_size, team_max_fleet_size)
+    # assert batch_team_fleet_plan.shape == (batch_size, team_max_fleet_size, team_max_fleet_plan)
+    # assert batch_team_fleet_plan_mask.shape == (batch_size, team_max_fleet_size, team_max_fleet_plan)
+    # assert batch_opp_fleet_mask.shape == (batch_size, opp_max_fleet_size)
+    # assert batch_opp_fleet_plan.shape == (batch_size, opp_max_fleet_size, opp_max_fleet_plan)
+    # assert batch_opp_fleet_plan_mask.shape == (batch_size, opp_max_fleet_size, opp_max_fleet_plan)
+    # assert batch_shipyard_pos_x.shape == (batch_size, 1)
+    # assert batch_shipyard_pos_y.shape == (batch_size, 1)
+    # assert batch_shipyard_nr_ship.shape == (batch_size, 1)
+    # assert batch_shipyard_turn_controlled.shape == (batch_size, 1)
+    # assert batch_cardinality.shape == (batch_size, 1)
+    # assert batch_plan.shape == (batch_size, max_plan_len)
+    # assert batch_plan_mask.shape == (batch_size, max_plan_len)
     
     return dict(
-        fmap=batch_fmap,
-        global_info=batch_global_info,
+        step=batch_step,
         team_id=batch_team_id,
+        fmap=batch_fmap,
+        team_kore=batch_team_kore,
+        team_fleet_mask=batch_team_fleet_mask,
+        team_fleet_plan=batch_team_fleet_plan,
+        team_fleet_plan_mask=batch_team_fleet_plan_mask,
         team_fleet_pos_x=batch_team_fleet_pos_x,
         team_fleet_pos_y=batch_team_fleet_pos_y,
-        team_fleet_emb=batch_team_fleet_emb,
-        team_fleet_mask=batch_team_fleet_mask,
+        opp_kore=batch_opp_kore,
+        opp_fleet_mask=batch_opp_fleet_mask,
+        opp_fleet_plan=batch_opp_fleet_plan,
+        opp_fleet_plan_mask=batch_opp_fleet_plan_mask,
         opp_fleet_pos_x=batch_opp_fleet_pos_x,
         opp_fleet_pos_y=batch_opp_fleet_pos_y,
-        opp_fleet_emb=batch_opp_fleet_emb,
-        opp_fleet_mask=batch_opp_fleet_mask,
+        shipyard_pos_x=batch_shipyard_pos_x,
+        shipyard_pos_y=batch_shipyard_pos_y,
+        shipyard_nr_ship=batch_shipyard_nr_ship,
+        shipyard_turn_controlled=batch_shipyard_turn_controlled,
         action=batch_action,
-        action_mask=batch_action_mask,
-        ship_pos_x=batch_ship_pos_x,
-        ship_pos_y=batch_ship_pos_y,
+        spawn_nr=batch_spawn_nr,
+        launch_nr=batch_launch_nr,
+        is_spawn=batch_is_spawn,
+        is_launch=batch_is_launch,
+        plan=batch_plan,
+        plan_mask=batch_plan_mask,
     )
-
-
-class TorusConv2d(nn.Module):
-    def __init__(self, input_dim, output_dim, kernel_size, bn):
-        super().__init__()
-        self.edge_size = (kernel_size[0] // 2, kernel_size[1] // 2)
-        self.conv = nn.Conv2d(input_dim, output_dim, kernel_size=kernel_size)
-        self.bn = nn.BatchNorm2d(output_dim) if bn else None
-
-    def forward(self, x):
-        h = torch.cat([x[:,:,:,-self.edge_size[1]:], x, x[:,:,:,:self.edge_size[1]]], dim=3)
-        h = torch.cat([h[:,:,-self.edge_size[0]:], h, h[:,:,:self.edge_size[0]]], dim=2)
-        h = self.conv(h)
-        h = self.bn(h) if self.bn is not None else h
-        return h
-
-
-class SpatialEncoder(nn.Module):
-    def __init__(self, input_ch, filters, layers):
-        super().__init__()
-        self.conv0 = TorusConv2d(input_ch, filters, (3, 3), bn=True)
-        self.blocks = nn.ModuleList([TorusConv2d(filters, filters, (3, 3), bn=True) for _ in range(layers)])
-
-    def forward(self, x):
-        h = self.conv0(x)
-        for block in self.blocks:
-            h = h + F.relu_(block(h))
-        return h
-
-
-class ScalarEncoder(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(3, 128),
-            nn.BatchNorm1d(128), # Is bn neccessary?
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Linear(128, 288),
-        )
-    
-    def forward(self, x):
-        return self.fc(x)
-        
-
-def he_initialization(m):
-    if isinstance(m, (nn.Linear, nn.Conv2d)):
-        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-    elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-        nn.init.constant_(m.weight, 1)
-        nn.init.constant_(m.bias, 0)
-
-
-class KoreNet(nn.Module):
-    def __init__(self, input_ch):
-        super().__init__()
-        self.scalar_encoder = ScalarEncoder(3, 288)
-        self.spatial_encoder = SpatialEncoder(input_ch, filters=32, layers=12)  
-        self.up_projection = nn.Sequential(
-            nn.Linear(32, 288),
-            # nn.LayerNorm(288)
-        )
-
-        # Proper initialization is crucial
-        # https://github.com/pytorch/pytorch/issues/18182
-        self.scalar_encoder.apply(he_initialization)
-        self.spatial_encoder.apply(he_initialization)
-
-        # domain coding:
-        # SEP token = 0
-        # global info = 1
-        # spatial = 2
-        # fleet = 3
-        self.domain_emb = nn.Embedding(4, 288, padding_idx=0)
-        self.seq_pos_emb = nn.Embedding(1000, 288)
-        self.sep_token = nn.Parameter(torch.zeros(1, 288))
-        self.tgt_len = 20
-        self.tgt_pos_emb = nn.Embedding(20, 288)
-        self.team_emb = nn.Embedding(10, 288) # Sanity check! Max team nr. is 10?
-        self.pos_emb_x = nn.Embedding(22, 144, padding_idx=21)
-        self.pos_emb_y = nn.Embedding(22, 144, padding_idx=21)
-
-        self.transformer_encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=288, 
-                nhead=4, 
-                dim_feedforward=768, 
-                activation="gelu", 
-                norm_first=True
-            ),
-            num_layers=3,
-        )
-        self.transformer_decoder = nn.TransformerDecoder(
-            nn.TransformerDecoderLayer(
-                d_model=288, 
-                nhead=4, 
-                dim_feedforward=768, 
-                activation="gelu", 
-                norm_first=True
-            ), 
-            num_layers=3
-        )
-        self.fc = nn.Linear(288, 23, bias=False)
-    
-    def prepare_input_seq(self, x):
-        # Current cuda device
-        self.cur_device = x["fmap"].device
-
-        global_info = x["global_info"]
-        self.batch_size = global_info.shape[0]
-        scalar_token = self.scalar_encoder(global_info).unsqueeze(1) # shape (bs, 1, 288)
-        # print("scalar", scalar_token)
-        
-        fmap = self.spatial_encoder(x["fmap"])
-        spatial_tokens = fmap.view(fmap.shape[0], fmap.shape[1], -1).permute(0, 2, 1)
-        spatial_tokens = self.up_projection(spatial_tokens) # shape (bs, 441, 288)
-        # print("spatial", spatial_tokens)
-
-        map_pos_x_embs = torch.arange(21, device=self.cur_device).unsqueeze(1).repeat(1, 21).view(1, -1).expand(fmap.shape[0], 21 * 21)
-        map_pos_x_embs = self.pos_emb_x(map_pos_x_embs.long()) # input to f.embedding is a Long tensor
-        map_pos_y_embs = torch.arange(21, device=self.cur_device).unsqueeze(0).repeat(fmap.shape[0], 21)
-        map_pos_y_embs = self.pos_emb_y(map_pos_y_embs.long())
-        map_pos_embs = torch.cat([map_pos_x_embs, map_pos_y_embs], dim=2)
-        spatial_tokens += map_pos_embs
-        
-        team_fleet_tokens = x["team_fleet_emb"] # shape (bs, n_fleet, 288)
-        team_pos_x_embs = self.pos_emb_x(x["team_fleet_pos_x"].long())
-        team_pos_y_embs = self.pos_emb_y(x["team_fleet_pos_y"].long())
-        team_pos_embs = torch.cat([team_pos_x_embs, team_pos_y_embs], dim=2)
-        team_fleet_tokens += team_pos_embs
-        
-        opp_fleet_tokens = x["opp_fleet_emb"] # shape (bs, n_fleet, 288)
-        opp_pos_x_embs = self.pos_emb_x(x["opp_fleet_pos_x"].long())
-        opp_pos_y_embs = self.pos_emb_y(x["opp_fleet_pos_y"].long())
-        opp_pos_embs = torch.cat([opp_pos_x_embs, opp_pos_y_embs], dim=2)
-        opp_fleet_tokens += opp_pos_embs
-        
-        # Full sequence
-        sep_token = self.sep_token.unsqueeze(0).expand(fmap.shape[0], 1, -1) # shape (bs, 1, 288)
-        seq = torch.cat([scalar_token, spatial_tokens, sep_token, team_fleet_tokens, sep_token, opp_fleet_tokens], dim=1)
-        
-        domain_tokens = [1] + [2] * spatial_tokens.shape[1] + [0] + [3] * team_fleet_tokens.shape[1] + [0] + [3] * opp_fleet_tokens.shape[1]
-        domain_tokens = torch.tensor(domain_tokens, device=self.cur_device).unsqueeze(0).expand(self.batch_size, -1)
-        domain_embs = self.domain_emb(domain_tokens.long())
-        
-        seq_pos_embs = torch.arange(seq.shape[1], device=self.cur_device).unsqueeze(0).expand(seq.shape[0], -1)
-        seq_pos_embs = self.seq_pos_emb(seq_pos_embs.long())
-        seq = seq + domain_embs + seq_pos_embs
-        
-        # Sequence mask
-        # ATTENTION!
-        # Pad = True, not-pad = False
-        global_info_mask = torch.tensor([False], device=self.cur_device, dtype=torch.bool).expand(seq.shape[0]).unsqueeze(1)
-        sep_mask = torch.tensor([True], device=self.cur_device, dtype=torch.bool).expand(seq.shape[0]).unsqueeze(1)
-        spatial_mask = torch.tensor(False, device=self.cur_device, dtype=torch.bool).expand(seq.shape[0], 21 * 21)
-        team_fleet_mask = x["team_fleet_mask"].bool()
-        opp_fleet_mask = x["opp_fleet_mask"].bool()
-        seq_mask = torch.cat([global_info_mask, spatial_mask, sep_mask, team_fleet_mask, sep_mask, opp_fleet_mask], dim=1)
-
-        return seq, seq_mask
-    
-    def prepare_target_seq(self, x):
-        pos_embs = torch.arange(self.tgt_len, device=self.cur_device)
-        pos_embs = self.tgt_pos_emb(pos_embs.long()).unsqueeze(0).expand(self.batch_size, -1, -1)
-
-        ship_pos_x = x["ship_pos_x"].unsqueeze(1)
-        ship_pos_y = x["ship_pos_y"].unsqueeze(1)
-        ship_pos_x_embs = self.pos_emb_x(ship_pos_x.long())
-        ship_pos_y_embs = self.pos_emb_y(ship_pos_y.long())
-        ship_pos_embs = torch.cat([ship_pos_x_embs, ship_pos_y_embs], dim=2).expand(-1, self.tgt_len, -1)
-        
-        team_embs = self.team_emb(x["team_id"]).expand(-1, self.tgt_len, -1)
-
-        tgt = pos_embs + ship_pos_embs + team_embs
-
-        tgt_mask = x["action_mask"]
-        return tgt, tgt_mask
-    
-    def get_encoder_output(self, src, src_key_padding_mask):
-        return self.transformer_encoder(
-            src, 
-            src_key_padding_mask=src_key_padding_mask
-        )
-    
-    def get_decoder_output(self, memory, tgt, tgt_key_padding_mask, memory_key_padding_mask):
-        return self.transformer_decoder(
-            tgt=tgt, 
-            memory=memory, 
-            # tgt_key_padding_mask=tgt_key_padding_mask,
-            memory_key_padding_mask=memory_key_padding_mask
-        )
-
-    def forward(self, x):
-        src, src_key_padding_mask = self.prepare_input_seq(x)
-        tgt, tgt_key_padding_mask = self.prepare_target_seq(x)
-        src = src.permute(1, 0, 2)
-        tgt = tgt.permute(1, 0, 2)
-
-        memory = self.get_encoder_output(src, src_key_padding_mask)
-        out = self.get_decoder_output(
-            memory, 
-            tgt, 
-            tgt_key_padding_mask, 
-            memory_key_padding_mask=src_key_padding_mask
-        )
-
-        out = out.permute(1, 0, 2)
-        out = self.fc(out)
-        return out
 
 
 class LightningModel(pl.LightningModule):
@@ -335,48 +346,87 @@ class LightningModel(pl.LightningModule):
         self, 
         lr, 
         weight_decay,
-        warmup_ratio,
+        warmup_steps,
         batch_size, 
         num_epochs, 
         num_gpus, 
-        num_samples
+        num_samples,
+        debug=False
     ):
         super().__init__()
         self.save_hyperparameters()
         self.lr = lr
         self.weight_decay = weight_decay
-        self.warmup_ratio = warmup_ratio
+        self.warmup_steps = warmup_steps
         self.batch_size = batch_size
         self.num_epochs = num_epochs
         self.num_gpus = num_gpus
         self.num_samples = num_samples
+        self.debug = debug
 
-        self.net = KoreNet(input_ch=11)
-        self.ce_loss = nn.CrossEntropyLoss(reduction="none")
+        self.net = KoreNet(debug)
+
+        self.eps = 1e-7
     
     def forward(self, x):
         return self.net(x)
     
     def training_step(self, batch, batch_idx):
-        action, action_mask = batch["action"], batch["action_mask"]
         out = self(batch)
-        out = out.permute(0, 2, 1)
-        loss_mask = (1 - action_mask.long()) # Flip the mask
-        loss = (self.ce_loss(out, action) * loss_mask).sum() / loss_mask.sum()
-        self.log("train_loss", loss)
+        
+        action_loss = nn.CrossEntropyLoss()(out["action_logit"], batch["action"])
+        
+        spawn_nr_loss = nn.CrossEntropyLoss(reduction="none")(out["spawn_nr_logit"], batch["spawn_nr"]).unsqueeze(1)
+        spawn_nr_loss = (spawn_nr_loss * batch["is_spawn"]).sum() / (batch["is_spawn"].sum() + self.eps)
+
+        launch_nr_loss = nn.MSELoss(reduction="none")(out["launch_nr_logit"], batch["launch_nr"])
+        launch_nr_loss = (launch_nr_loss * batch["is_launch"]).sum() / (batch["is_launch"].sum() + self.eps)
+        
+        pred_plan = out["plan_logit"].permute(0, 2, 1)
+        plan_loss = nn.CrossEntropyLoss(reduction="none")(pred_plan, batch["plan"])
+        plan_loss = (plan_loss * batch["plan_mask"]).sum() / batch["plan_mask"].sum()
+
+        loss = action_loss + spawn_nr_loss + launch_nr_loss + plan_loss
+
+        self.log("train/loss", loss)
+        self.log("train/action_loss", action_loss)
+        self.log("train/spawn_nr_loss", spawn_nr_loss)
+        self.log("train/launch_nr_loss", launch_nr_loss)
+        self.log("train/plan_loss", plan_loss)
         return loss
     
     def validation_step(self, batch, batch_idx):
-        action, action_mask = batch["action"], batch["action_mask"]
         out = self(batch)
-        out = out.permute(0, 2, 1) 
-        loss_mask = (1 - action_mask.long())
-        loss = (self.ce_loss(out, action) * loss_mask).sum() / loss_mask.sum()
-        self.log("val_loss", loss)
-        return {
-            "out": out.detach().cpu(),
-            "action": action.detach().cpu()
-        }
+        
+        action_loss = nn.CrossEntropyLoss()(out["action_logit"], batch["action"])
+        
+        spawn_nr_loss = nn.CrossEntropyLoss(reduction="none")(out["spawn_nr_logit"], batch["spawn_nr"]).unsqueeze(1)
+        spawn_nr_loss = (spawn_nr_loss * batch["is_spawn"]).sum() / (batch["is_spawn"].sum() + self.eps)
+
+        launch_nr_loss = nn.MSELoss(reduction="none")(out["launch_nr_logit"], batch["launch_nr"])
+        launch_nr_loss = (launch_nr_loss * batch["is_launch"]).sum() / (batch["is_launch"].sum() + self.eps)
+        
+        pred_plan = out["plan_logit"].permute(0, 2, 1)
+        plan_loss = nn.CrossEntropyLoss(reduction="none")(pred_plan, batch["plan"])
+        plan_loss = (plan_loss * batch["plan_mask"]).sum() / batch["plan_mask"].sum()
+
+        loss = action_loss + spawn_nr_loss + launch_nr_loss + plan_loss
+
+        self.log("val/loss", loss)
+        self.log("val/action_loss", action_loss)
+        self.log("val/spawn_nr_loss", spawn_nr_loss)
+        self.log("val/launch_nr_loss", launch_nr_loss)
+        self.log("val/plan_loss", plan_loss)
+        return dict(
+            action_logit=out["action_logit"].detach().cpu(),
+            action=batch["action"].detach().cpu(),
+            spawn_nr_logit=out["spawn_nr_logit"].detach().cpu(),
+            spawn_nr=batch["spawn_nr"].detach().cpu(),
+            plan_logit=out["plan_logit"].detach().cpu(),
+            plan=batch["plan"].detach().cpu(),
+            plan_mask=batch["plan_mask"].detach().cpu(),
+            is_launch=batch["is_launch"].detach().cpu(),
+        )
     
     def validation_epoch_end(self, validation_step_outputs):
         outs = {
@@ -384,49 +434,61 @@ class LightningModel(pl.LightningModule):
             for k in validation_step_outputs[0]
         }
 
-        preds = torch.cat(outs["out"], dim=0) # shape (n, 23, 20)
-        preds = torch.softmax(preds.permute(0, 2, 1), dim=1).argmax(dim=1)
-        actions = torch.cat(outs["action"], dim=0) # shape (n, 20)
-        preds = preds.tolist()
-        actions = actions.tolist()
+        action_logit = torch.cat(outs["action_logit"], dim=0)
+        pred_action = action_logit.softmax(dim=1).argmax(dim=1)
+        action = torch.cat(outs["action"], dim=0)
+        action_acc = (pred_action == action).float().mean().item()
+        self.log("val/action_accuracy", action_acc)
 
-        def preprocess(pred, action):
-            try:
-                first_padding_pos = action.index(shipyard_w2i["PAD"])
-            except:
-                first_padding_pos = None
+        pred_action = pred_action.numpy().tolist()
+        action = action.numpy().tolist()
+        action_label = ["IDLE", "SPAWN", "LAUNCH"]
+        for x in range(3):
+            tp = 0
+            pred_count = 0
+            true_count = 0
             
-            if first_padding_pos is not None:
-                pred = pred[:first_padding_pos]
-                action = action[:first_padding_pos]
+            for i in range(len(pred_action)):
+                pred_count += pred_action[i] == x
+                true_count += action[i] == x
+                if pred_action[i] == x:
+                    tp += pred_action[i] == action[i]
             
-            pred = list(map(shipyard_i2w.get, pred))
-            action = list(map(shipyard_i2w.get, action))
-            return pred, action
-        
-        predictions = []
-        references = []
-        for pred, action in zip(preds, actions):
-            new_pred, new_action = preprocess(pred, action)
-            predictions.append(new_pred)
-            references.append([new_action])
+            precision = tp / (pred_count + self.eps)
+            recall = tp / (true_count + self.eps)
+            
+            if self.debug:
+                print(action_label[x], f"precision={precision}, recall={recall}")
 
-        bleu = datasets.load_metric("bleu")
-        results = bleu.compute(predictions=predictions, references=references)
-        self.log("1-gram precision", results["precisions"][0])
+            self.log(f"val/{action_label[x]}_precision", precision)
+            self.log(f"val/{action_label[x]}_recall", recall) 
 
-        flatten_predictions = np.concatenate(predictions)
-        flatten_references = np.concatenate([x[0] for x in references])
-        assert flatten_predictions.shape == flatten_references.shape
-        accuracy = np.mean(flatten_predictions == flatten_references)
-        self.log("accuracy", accuracy)
+        spawn_nr_logit = torch.cat(outs["spawn_nr_logit"], dim=0)
+        pred_spawn_nr = spawn_nr_logit.softmax(dim=1).argmax(dim=1)
+        spawn_nr = torch.cat(outs["spawn_nr"], dim=0)
+        spawn_nr_acc = (pred_spawn_nr == spawn_nr).float().mean().item()
+        self.log("val/spawn_nr_accuracy", spawn_nr_acc)
+
+        plan_logit = torch.cat(outs["plan_logit"], dim=0)
+        pred_plan = plan_logit.softmax(dim=2).argmax(dim=2)
+        plan = torch.cat(outs["plan"], dim=0)
+        plan_mask = torch.cat(outs["plan_mask"], dim=0)
+        is_launch = torch.cat(outs["is_launch"], dim=0).squeeze(1)
+        plan_acc_per_sample = ((pred_plan == plan).float() * plan_mask).sum(dim=1) / plan_mask.sum(dim=1)
+        plan_acc = ((plan_acc_per_sample * is_launch).sum() / is_launch.sum()).item()
+        self.log("val/plan_token_accuracy", plan_acc)
+
+        if self.debug:
+            print("Action accuracy", action_acc)
+            print("Spawn_nr accuracy", spawn_nr_acc)
+            print("Plan token accuracy", plan_acc)
 
     def training_step_end(self, training_step_outputs):
         (lr,) = self.scheduler.get_last_lr()
         self.log("lr", lr)
     
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
+        optimizer = torch.optim.AdamW( # TODO: Use torch.optim.SGD for spatial_encoder
             self.parameters(),
             lr=self.lr,
             weight_decay=self.weight_decay,
@@ -437,7 +499,6 @@ class LightningModel(pl.LightningModule):
             // self.batch_size
             // self.num_gpus
         )
-        self.warmup_steps = int(self.warmup_ratio * total_steps)
         print(f"Number of warm-up steps: {self.warmup_steps}/{total_steps}")
         self.scheduler = get_cosine_schedule_with_warmup(
             optimizer, num_warmup_steps=self.warmup_steps, num_training_steps=total_steps
@@ -452,29 +513,32 @@ class LightningModel(pl.LightningModule):
 
 base_path = "/var/scratch/kvu400"
 def main(
-    lr=5e-4,
-    weight_decay=1e-6,
-    warmup_ratio=0.1,
+    lr=3e-4,
+    weight_decay=1e-2,
+    warmup_steps=1000,
     gradient_clip_val=0.5,
     num_gpus=1,
-    num_epochs=5,
+    num_epochs=20,
     batch_size=32,
     debug=True,
     train_csv_dir=os.path.join(base_path, "kore/train.csv"),
-    tensor_dir=os.path.join(base_path, "kore/replays_tensors"),
+    replay_dir=os.path.join(base_path, "kore/replays.pkl"),
 ):
     df = pd.read_csv(train_csv_dir)
     train_df, val_df, _, _ = train_test_split(
-        df, df["TokenizedAction"], stratify=df["NumFleet"], test_size=0.1, random_state=2022
+        df, df["Action"], stratify=df["Action"], test_size=0.1, random_state=2022
     )
-    train_df.sort_values(by=["NumFleet"], inplace=True)
-    val_df.sort_values(by=["NumFleet"], inplace=True)
-    num_teams = len(set(df["TeamNameId"]))
+    num_teams = len(set(df["TeamName"]))
     print("Train length:", len(train_df))
     print("Validation length:", len(val_df))
     print("Nr. teams:", num_teams)
 
-    train_ds = KoreTensorDataset(data=train_df, data_path=tensor_dir)
+    with open(replay_dir, "rb") as f:
+        ep = pickle.load(f)
+
+    print("Nr. of episodes", len(ep))
+
+    train_ds = KoreDataset(df=train_df, ep=ep)
     train_loader = DataLoader(
         train_ds, 
         collate_fn=CustomCollateFn, 
@@ -483,7 +547,7 @@ def main(
         pin_memory=True, 
         shuffle=True
     )
-    val_ds = KoreTensorDataset(data=val_df, data_path=tensor_dir)
+    val_ds = KoreDataset(df=val_df, ep=ep)
     val_loader = DataLoader(
         val_ds, 
         collate_fn=CustomCollateFn, 
@@ -496,11 +560,12 @@ def main(
     model = LightningModel(
         lr=lr,
         weight_decay=weight_decay,
-        warmup_ratio=warmup_ratio,
+        warmup_steps=warmup_steps,
         batch_size=batch_size, 
         num_gpus=num_gpus,
         num_epochs=num_epochs,
         num_samples=len(train_ds),
+        debug=debug
     )
     
     log_dir = os.path.join(base_path, "logs/" + datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
@@ -509,7 +574,7 @@ def main(
         print("Logs and model checkpoint will be saved to", log_dir)
 
     checkpoint_callback = ModelCheckpoint(
-        monitor="val_loss",
+        monitor="val/loss",
         mode="min",
         dirpath=log_dir,
     )
@@ -525,10 +590,10 @@ def main(
         log_every_n_steps=1 if debug else 50,
         fast_dev_run=5 if debug else False,
         default_root_dir=log_dir,
-        gradient_clip_val=1.0, 
+        gradient_clip_val=gradient_clip_val, 
         max_epochs=num_epochs, 
         track_grad_norm=2,
-        enable_progress_bar=True,
+        enable_progress_bar=debug,
         logger=not debug,
         enable_checkpointing=not debug,
         callbacks=callback_list,
