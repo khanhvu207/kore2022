@@ -144,8 +144,9 @@ class FusionTransformer(nn.Module):
         self.src_ln = nn.LayerNorm(128)
         self.tgt_ln = nn.LayerNorm(128)
 
+        self.max_tgt_plan_len = 9
         self.sep_token = nn.Parameter(nn.init.normal_(torch.empty(1, 128)))
-        self.tgt_token = nn.Parameter(nn.init.normal_(torch.empty(20, 128)))
+        self.tgt_cls_token = nn.Parameter(nn.init.normal_(torch.empty(1, 128)))
         
         self.global_info_marker = nn.Parameter(nn.init.normal_(torch.empty(1, 128))) 
         self.fmap_marker = nn.Parameter(nn.init.normal_(torch.empty(1, 128))) 
@@ -161,7 +162,7 @@ class FusionTransformer(nn.Module):
         self.plan_token_embedding = nn.Embedding(18, 128, padding_idx=fleet_w2i["PAD"])
         self.plan_pos_embedding = nn.Embedding(20, 128)
         self.plan_fc = nn.Linear(128, 128)
-    
+
     def _get_fleet_plan_emb(self, fleet_plan, fleet_plan_mask):
         bs, nr_fleet, plan_len = fleet_plan.shape
         
@@ -244,16 +245,23 @@ class FusionTransformer(nn.Module):
         seq = seq.permute(1, 0, 2)
         memory = self.encoder(seq, src_key_padding_mask=seq_mask)
 
-        # Decoder
-        # TODO: Teacher-forcing training
-        tgt_seq = self.tgt_token.expand((bs, 20, 128))
-        tgt_seq = tgt_seq + self.team_id(x["team_id"]).expand((-1, 20, -1)) + self.step(x["step"]).expand((-1, 20, -1))
+        # Decoder (teacher-forcing)
+        plan = x["plan"][:, :self.max_tgt_plan_len]
+        plan_emb = self.plan_token_embedding(plan)
+        plan_pos_emb = torch.arange(plan_emb.shape[1], dtype=torch.long, device=plan_emb.device)
+        plan_pos_emb = self.plan_pos_embedding(plan_pos_emb).expand(plan_emb.shape)
+        plan_emb = plan_emb + plan_pos_emb
+
+        cls_token = self.tgt_cls_token.expand((bs, 1, 128))
+        cls_token = cls_token + self.team_id(x["team_id"]).expand(cls_token.shape) + self.step(x["step"]).expand(cls_token.shape)
+        
+        tgt_seq = torch.cat([cls_token, plan_emb], dim=1)
+        assert tgt_seq.shape[1] == 10, "The tgt_seq's length is incorrect!"
+
         tgt_seq = self.tgt_ln(tgt_seq)
         tgt_seq = tgt_seq.permute(1, 0, 2)
-        
         out = self.decoder(tgt=tgt_seq, memory=memory, memory_key_padding_mask=seq_mask)
         return out.permute(1, 0, 2)
-    
     
 class KoreNet(nn.Module):
     def __init__(self, debug):

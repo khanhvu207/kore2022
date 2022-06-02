@@ -183,7 +183,7 @@ class KoreDataset(Dataset):
         is_spawn = row["Action"] == "SPAWN"
         is_launch = row["Action"] == "LAUNCH"
         
-        plan = list(str(row["Plan"]) if str(row["Plan"]) != "nan" else "") + ["EOS"]
+        plan = ["CLS"] + list(str(row["Plan"]) if str(row["Plan"]) != "nan" else "") + ["EOS"]
         plan = torch.tensor(list(map(shipyard_w2i.get, plan)), dtype=torch.long)
         profile(profiler, "finalizing", self.debug)
         
@@ -285,13 +285,16 @@ def CustomCollateFn(batch):
     batch_is_launch = torch.tensor([x["is_launch"] for x in batch], dtype=torch.long).unsqueeze(1)
 
     plans = [x["plan"] for x in batch]
-    max_plan_len = 19 # max([plan.shape[0] for plan in plans])
+    max_plan_len = 10 # max([plan.shape[0] for plan in plans])
     batch_plan = torch.full((batch_size, max_plan_len), shipyard_w2i["PAD"], dtype=torch.long)
     batch_plan_mask = torch.zeros((batch_size, max_plan_len), dtype=torch.long)
     for batch_idx, plan in enumerate(plans):
         plan_len = plan.shape[0]
         batch_plan[batch_idx, :plan_len].copy_(plan)
         batch_plan_mask[batch_idx, :plan_len] = 1
+
+    # print(batch_plan)
+    # print(batch_plan_mask)
     
     # Sanity check
     # assert batch_step.shape == (batch_size, 1)
@@ -383,8 +386,10 @@ class LightningModel(pl.LightningModule):
         launch_nr_loss = (launch_nr_loss * batch["is_launch"]).sum() / (batch["is_launch"].sum() + self.eps)
         
         pred_plan = out["plan_logit"].permute(0, 2, 1)
-        plan_loss = nn.CrossEntropyLoss(reduction="none")(pred_plan, batch["plan"])
-        plan_loss = (plan_loss * batch["plan_mask"]).sum() / batch["plan_mask"].sum()
+        ground_truth = batch["plan"][:, 1:] # Shifted one position to the left
+        ground_truth_mask = batch["plan_mask"][:, 1:]
+        plan_loss = nn.CrossEntropyLoss(reduction="none")(pred_plan, ground_truth)
+        plan_loss = (plan_loss * ground_truth_mask).sum() / ground_truth_mask.sum()
 
         loss = action_loss + spawn_nr_loss + launch_nr_loss + plan_loss
 
@@ -407,8 +412,10 @@ class LightningModel(pl.LightningModule):
         launch_nr_loss = (launch_nr_loss * batch["is_launch"]).sum() / (batch["is_launch"].sum() + self.eps)
         
         pred_plan = out["plan_logit"].permute(0, 2, 1)
-        plan_loss = nn.CrossEntropyLoss(reduction="none")(pred_plan, batch["plan"])
-        plan_loss = (plan_loss * batch["plan_mask"]).sum() / batch["plan_mask"].sum()
+        ground_truth = batch["plan"][:, 1:] # Shifted one position to the left
+        ground_truth_mask = batch["plan_mask"][:, 1:]
+        plan_loss = nn.CrossEntropyLoss(reduction="none")(pred_plan, ground_truth)
+        plan_loss = (plan_loss * ground_truth_mask).sum() / ground_truth_mask.sum()
 
         loss = action_loss + spawn_nr_loss + launch_nr_loss + plan_loss
 
@@ -423,8 +430,8 @@ class LightningModel(pl.LightningModule):
             spawn_nr_logit=out["spawn_nr_logit"].detach().cpu(),
             spawn_nr=batch["spawn_nr"].detach().cpu(),
             plan_logit=out["plan_logit"].detach().cpu(),
-            plan=batch["plan"].detach().cpu(),
-            plan_mask=batch["plan_mask"].detach().cpu(),
+            plan=ground_truth.detach().cpu(),
+            plan_mask=ground_truth_mask.detach().cpu(),
             is_launch=batch["is_launch"].detach().cpu(),
         )
     
@@ -488,7 +495,7 @@ class LightningModel(pl.LightningModule):
         self.log("lr", lr)
     
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW( # TODO: Use torch.optim.SGD for spatial_encoder
+        optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.lr,
             weight_decay=self.weight_decay,
@@ -568,7 +575,11 @@ def main(
         debug=debug
     )
     
-    log_dir = os.path.join(base_path, "logs/" + datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
+    log_dir = os.path.join(base_path, "logs/" + datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S'))
+    log_dir += f"-lr-{lr}"
+    log_dir += f"-gpu-{num_gpus}"
+    log_dir += f"-bs-{batch_size}"
+
     if not debug:
         os.makedirs(log_dir, exist_ok=False)
         print("Logs and model checkpoint will be saved to", log_dir)
@@ -584,7 +595,7 @@ def main(
         accelerator="gpu",
         devices=num_gpus,
         deterministic=True,
-        precision=32,
+        precision=32, # Use fp32 for now
         strategy="ddp",
         detect_anomaly=debug,
         log_every_n_steps=1 if debug else 50,
