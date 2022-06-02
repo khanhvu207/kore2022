@@ -25,3 +25,6 @@ Removing **BatchNorm2d** in the SpatialEncoder resolved the problem mentioned ab
 I converted the **spawn_nr_head** into a multiclass classification because there are only ten possible outcomes.
 
 Tracking precision and recall for **action** prediction is useful due to class imbalance; for instance, 66% of the classes is LAUNCH, so the model would just predict this majority class and achieve 66% action accuracy. Furthermore, I removed bias of the **action_head** layer.
+
+## May 28, 2022
+![modeling](asset/kore.png)
