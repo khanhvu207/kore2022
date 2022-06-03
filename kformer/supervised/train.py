@@ -433,6 +433,7 @@ class LightningModel(pl.LightningModule):
             plan=ground_truth.detach().cpu(),
             plan_mask=ground_truth_mask.detach().cpu(),
             is_launch=batch["is_launch"].detach().cpu(),
+            is_spawn=batch["is_spawn"].detach().cpu(),
         )
     
     def validation_epoch_end(self, validation_step_outputs):
@@ -473,7 +474,9 @@ class LightningModel(pl.LightningModule):
         spawn_nr_logit = torch.cat(outs["spawn_nr_logit"], dim=0)
         pred_spawn_nr = spawn_nr_logit.softmax(dim=1).argmax(dim=1)
         spawn_nr = torch.cat(outs["spawn_nr"], dim=0)
-        spawn_nr_acc = (pred_spawn_nr == spawn_nr).float().mean().item()
+        is_spawn = torch.cat(outs["is_spawn"], dim=0).squeeze(1)
+        # spawn_nr_acc = (pred_spawn_nr == spawn_nr).float().mean().item()
+        spawn_nr_acc = (((pred_spawn_nr == spawn_nr) * is_spawn).sum() / is_spawn.sum()).item()
         self.log("val/spawn_nr_accuracy", spawn_nr_acc)
 
         plan_logit = torch.cat(outs["plan_logit"], dim=0)
