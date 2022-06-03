@@ -163,6 +163,12 @@ class FusionTransformer(nn.Module):
         self.plan_pos_embedding = nn.Embedding(20, 128)
         self.plan_fc = nn.Linear(128, 128)
 
+    def _get_autoregressive_attn_mask(self, tgt_len, device):
+        # Create an upper triangular matrix filled with -inf
+        mask = torch.triu(torch.ones(tgt_len, tgt_len, device=device), diagonal=1)
+        mask[mask.bool()] = -float("inf")
+        return mask
+
     def _get_fleet_plan_emb(self, fleet_plan, fleet_plan_mask):
         bs, nr_fleet, plan_len = fleet_plan.shape
         
@@ -258,10 +264,17 @@ class FusionTransformer(nn.Module):
         tgt_seq = torch.cat([cls_token, plan_emb], dim=1)
         assert tgt_seq.shape[1] == 10, "The tgt_seq's length is incorrect!"
 
+        tgt_attn_mask = self._get_autoregressive_attn_mask(tgt_len=tgt_seq.shape[1], device=tgt_seq.device)
+
         tgt_seq = self.tgt_ln(tgt_seq)
         tgt_seq = tgt_seq.permute(1, 0, 2)
-        out = self.decoder(tgt=tgt_seq, memory=memory, memory_key_padding_mask=seq_mask)
-        return out.permute(1, 0, 2)
+        out = self.decoder(
+            tgt=tgt_seq, 
+            tgt_mask=tgt_attn_mask,
+            memory=memory, 
+            memory_key_padding_mask=seq_mask
+        ).permute(1, 0, 2)
+        return out
     
 class KoreNet(nn.Module):
     def __init__(self, debug):
