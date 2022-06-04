@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import Dataset, DataLoader
 
@@ -475,7 +476,6 @@ class LightningModel(pl.LightningModule):
         pred_spawn_nr = spawn_nr_logit.softmax(dim=1).argmax(dim=1)
         spawn_nr = torch.cat(outs["spawn_nr"], dim=0)
         is_spawn = torch.cat(outs["is_spawn"], dim=0).squeeze(1)
-        # spawn_nr_acc = (pred_spawn_nr == spawn_nr).float().mean().item()
         spawn_nr_acc = (((pred_spawn_nr == spawn_nr) * is_spawn).sum() / is_spawn.sum()).item()
         self.log("val/spawn_nr_accuracy", spawn_nr_acc)
 
@@ -594,6 +594,14 @@ def main(
     )
     callback_list = [checkpoint_callback] if not debug else []
 
+    wandb_logger = WandbLogger(
+        project="kore2022",
+        entity="kaggle-kvu",
+        name=f"lr-{lr}-weight_decay-{weight_decay}-nepochs-{num_epochs}",
+        save_dir=log_dir,
+        offline=debug,
+    )
+
     trainer = pl.Trainer(
         accelerator="gpu",
         devices=num_gpus,
@@ -608,7 +616,7 @@ def main(
         max_epochs=num_epochs, 
         track_grad_norm=2,
         enable_progress_bar=debug,
-        logger=not debug,
+        logger=False if debug else wandb_logger,
         enable_checkpointing=not debug,
         callbacks=callback_list,
     )
