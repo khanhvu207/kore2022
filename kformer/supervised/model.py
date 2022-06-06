@@ -66,56 +66,6 @@ class ScalarEncoder(nn.Module):
 
     def forward(self, x):
         return self.fc(x)
-    
-    
-# class FlightPlanTransformerEncoder(nn.Module):
-#     def __init__(self):
-#         super().__init__()
-#         self.token_embedding = nn.Embedding(18, 128)
-#         self.pos_embedding = nn.Embedding(20, 128)
-#         self.encoder = nn.TransformerEncoder(
-#             nn.TransformerEncoderLayer(
-#                 d_model=128, 
-#                 nhead=1,
-#                 dim_feedforward=256,
-#                 activation="gelu",
-#                 norm_first=True,
-#             ),
-#             num_layers=2,
-#         )
-    
-#     def forward(self, fleet_plan, fleet_plan_mask):
-#         bs, nr_fleet, plan_len = fleet_plan.shape
-#         fleet_plan = fleet_plan.reshape(bs * nr_fleet, -1)
-#         fleet_plan_mask = fleet_plan_mask.view(bs * nr_fleet, -1)
-#         seq_emb = self.token_embedding(fleet_plan)
-#         seq_emb = seq_emb.permute(1, 0, 2)
-#         out = self.encoder(seq_emb, src_key_padding_mask=fleet_plan_mask).permute(1, 0, 2)
-#         return out.reshape(bs, nr_fleet, plan_len, 128)[:, :, 0, :]
-
-
-# class FlightPlanFcEncoder(nn.Module):
-#     def __init__(self):
-#         super().__init__()
-#         self.token_embedding = nn.Embedding(18, 128, padding_idx=fleet_w2i["PAD"])
-#         self.pos_embedding = nn.Embedding(20, 128)
-#         self.fc = nn.Linear(128, 128) # Do we need this transformation?
-        
-#     def forward(self, fleet_plan, fleet_plan_mask):
-#         bs, nr_fleet, plan_len = fleet_plan.shape
-        
-#         seq_emb = self.token_embedding(fleet_plan) # shape (bs, nr_fleet, plan_len, 128)
-#         pos_emb = torch.arange(plan_len, dtype=torch.long, device=seq_emb.device)
-#         pos_emb = self.pos_embedding(pos_emb) # shape (plan_len, 128)
-#         pos_emb = pos_emb.expand(seq_emb.shape)
-#         seq_emb = seq_emb + pos_emb
-        
-#         seq_emb = self.fc(seq_emb)
-        
-#         inverted_mask = 1 - fleet_plan_mask.long().unsqueeze(3).expand(seq_emb.shape)
-#         seq_emb = seq_emb * inverted_mask
-#         fleet_emb = seq_emb.sum(dim=2) # Bag of words
-#         return fleet_emb # shape (bs, nr_fleet, 128)
 
 
 class FusionTransformer(nn.Module):
@@ -125,21 +75,21 @@ class FusionTransformer(nn.Module):
             nn.TransformerEncoderLayer(
                 d_model=128, 
                 nhead=4,
-                dim_feedforward=256,
+                dim_feedforward=512,
                 activation="gelu",
                 norm_first=True,
             ),
-            num_layers=6,
+            num_layers=8,
         )
         self.decoder = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
                 d_model=128, 
                 nhead=4,
-                dim_feedforward=256,
+                dim_feedforward=512,
                 activation="gelu",
                 norm_first=True,
             ),
-            num_layers=3,
+            num_layers=4,
         )
         self.src_ln = nn.LayerNorm(128)
         self.tgt_ln = nn.LayerNorm(128)
@@ -203,7 +153,7 @@ class FusionTransformer(nn.Module):
         # Replace some tokens with zero vector
         if self.training is True:
             randomized_indicies = torch.randperm(441)
-            masked_indices = randomized_indicies[:69]
+            masked_indices = randomized_indicies[:69] # I like 69 :D
             fmap_emb[:, masked_indices, :] = fmap_emb[:, masked_indices, :].fill_(0) 
         
         # Add positional embeddings
@@ -247,7 +197,7 @@ class FusionTransformer(nn.Module):
         seq_mask[:, fmap_len+2+team_fleet_len:].copy_(opp_fleet_mask)
         
         # Encoder
-        seq = self.src_ln(seq)
+        seq = self.src_ln(seq) # LayerNorm
         seq = seq.permute(1, 0, 2)
         memory = self.encoder(seq, src_key_padding_mask=seq_mask)
 
@@ -258,15 +208,20 @@ class FusionTransformer(nn.Module):
         plan_pos_emb = self.plan_pos_embedding(plan_pos_emb).expand(plan_emb.shape)
         plan_emb = plan_emb + plan_pos_emb
 
+        shipyard_pos_emb = torch.cat([self.pos_x(x["shipyard_pos_x"]), self.pos_y(x["shipyard_pos_y"])], dim=2)
         cls_token = self.tgt_cls_token.expand((bs, 1, 128))
-        cls_token = cls_token + self.team_id(x["team_id"]).expand(cls_token.shape) + self.step(x["step"]).expand(cls_token.shape)
+        cls_token = cls_token + self.team_id(x["team_id"]).expand(cls_token.shape)  # What is the current team?
+        cls_token = cls_token + self.step(x["step"]).expand(cls_token.shape) # What is the current time-step?
+        cls_token = cls_token + shipyard_pos_emb.expand(cls_token.shape) # Where is the current shipyard?
+        cls_token = cls_token + self.team_marker.expand(cls_token.shape) # This shipyard belongs to my team.
         
+        # Make tgt_seq
         tgt_seq = torch.cat([cls_token, plan_emb], dim=1)
         assert tgt_seq.shape[1] == 10, "The tgt_seq's length is incorrect!"
 
         tgt_attn_mask = self._get_autoregressive_attn_mask(tgt_len=tgt_seq.shape[1], device=tgt_seq.device)
 
-        tgt_seq = self.tgt_ln(tgt_seq)
+        tgt_seq = self.tgt_ln(tgt_seq) # LayerNorm
         tgt_seq = tgt_seq.permute(1, 0, 2)
         out = self.decoder(
             tgt=tgt_seq, 
@@ -287,12 +242,21 @@ class KoreNet(nn.Module):
         self.spatial_encoder = SpatialEncoder(input_ch=11, filters=32, layers=12)
         self.fusion_transformer = FusionTransformer()
 
-        self.action_head = nn.Linear(128, 3, bias=False) # bias=False can possibly work even better
+        self.action_head = nn.Linear(128, 3, bias=True)
+        
+        # self.spawn_nr_head = nn.Sequential(
+        #     nn.Linear(128, 512),
+        #     nn.BatchNorm1d(512),
+        #     nn.ReLU(),
+        #     nn.Linear(512, 11, bias=True),
+        # )
         self.spawn_nr_head = nn.Linear(128, 11, bias=True)
+        
         self.launch_nr_head = nn.Sequential(
-            nn.Linear(128, 1, bias=True),
-            nn.Sigmoid(), # Do I need sigmoid here?
+            nn.Linear(128, 1),
+            nn.Sigmoid(),
         )
+        
         self.plan_head = nn.Linear(128, 18, bias=True)
     
     def forward(self, x):
