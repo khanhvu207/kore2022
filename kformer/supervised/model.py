@@ -212,6 +212,7 @@ class FusionTransformer(nn.Module):
         plan_emb = plan_emb + plan_pos_emb
 
         shipyard_pos_emb = torch.cat([self.pos_x(x["shipyard_pos_x"]), self.pos_y(x["shipyard_pos_y"])], dim=2)
+
         cls_token = self.tgt_cls_token.expand((bs, 1, self.token_dim))
         cls_token = cls_token + self.team_id(x["team_id"]).expand(cls_token.shape)  # What is the current team?
         cls_token = cls_token + self.step(x["step"]).expand(cls_token.shape) # What is the current time-step?
