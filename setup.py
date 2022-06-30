@@ -12,5 +12,6 @@ setup(
         "black",
         "pympler",
         "datasets",
+        "wandb"
     ],
 )
