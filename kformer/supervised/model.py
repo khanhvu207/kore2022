@@ -10,7 +10,7 @@ class TorusConv2d(nn.Module):
     def __init__(self, input_dim, output_dim, kernel_size, use_gn):
         super().__init__()
         self.edge_size = (kernel_size[0] // 2, kernel_size[1] // 2)
-        self.conv = nn.Conv2d(input_dim, output_dim, kernel_size=kernel_size, bias=False)
+        self.conv = nn.Conv2d(input_dim, output_dim, kernel_size=kernel_size, bias=True) # bias=False if we use batchnorm
         self.gn = nn.GroupNorm(16, 32)
         self.use_gn = use_gn
 
