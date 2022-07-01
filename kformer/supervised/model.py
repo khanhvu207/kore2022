@@ -53,7 +53,6 @@ class ScalarEncoder(nn.Module):
         super().__init__()
         self.fc = nn.Sequential(
             nn.Linear(input_dim, 256),
-            # nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Linear(256, output_dim),
         )
@@ -81,6 +80,7 @@ class FusionTransformer(nn.Module):
                 dim_feedforward=512,
                 activation="gelu",
                 norm_first=True,
+                dropout=0.1,
             ),
             num_layers=8,
         )
@@ -91,13 +91,14 @@ class FusionTransformer(nn.Module):
                 dim_feedforward=512,
                 activation="gelu",
                 norm_first=True,
+                dropout=0.1,
             ),
             num_layers=4,
         )
         self.src_ln = nn.LayerNorm(self.token_dim)
         self.tgt_ln = nn.LayerNorm(self.token_dim)
 
-        self.max_tgt_plan_len = 9
+        self.max_tgt_plan_len = 11
         self.sep_token = nn.Parameter(nn.init.normal_(torch.empty(1, self.token_dim)))
         self.tgt_cls_token = nn.Parameter(nn.init.normal_(torch.empty(1, self.token_dim)))
         
@@ -221,7 +222,7 @@ class FusionTransformer(nn.Module):
         
         # Make tgt_seq
         tgt_seq = torch.cat([cls_token, plan_emb], dim=1)
-        assert tgt_seq.shape[1] == 10, "The tgt_seq's length is incorrect!"
+        # assert tgt_seq.shape[1] == 10, "The tgt_seq's length is incorrect!"
 
         tgt_attn_mask = self._get_autoregressive_attn_mask(tgt_len=tgt_seq.shape[1], device=tgt_seq.device)
 

@@ -286,7 +286,7 @@ def CustomCollateFn(batch):
     batch_is_launch = torch.tensor([x["is_launch"] for x in batch], dtype=torch.long).unsqueeze(1)
 
     plans = [x["plan"] for x in batch]
-    max_plan_len = 10 # max([plan.shape[0] for plan in plans])
+    max_plan_len = 12 # max([plan.shape[0] for plan in plans])
     batch_plan = torch.full((batch_size, max_plan_len), shipyard_w2i["PAD"], dtype=torch.long)
     batch_plan_mask = torch.zeros((batch_size, max_plan_len), dtype=torch.long)
     for batch_idx, plan in enumerate(plans):
@@ -355,6 +355,7 @@ class LightningModel(pl.LightningModule):
         num_epochs, 
         num_gpus, 
         num_samples,
+        token_dim,
         debug=False
     ):
         super().__init__()
@@ -368,7 +369,7 @@ class LightningModel(pl.LightningModule):
         self.num_samples = num_samples
         self.debug = debug
 
-        self.net = KoreNet(debug)
+        self.net = KoreNet(token_dim, debug)
 
         self.eps = 1e-7
     
@@ -530,6 +531,7 @@ def main(
     num_gpus=1,
     num_epochs=20,
     batch_size=32,
+    token_dim=128,
     debug=True,
     train_csv_dir=os.path.join(base_path, "kore/train.csv"),
     replay_dir=os.path.join(base_path, "kore/replays.pkl"),
@@ -575,6 +577,7 @@ def main(
         num_gpus=num_gpus,
         num_epochs=num_epochs,
         num_samples=len(train_ds),
+        token_dim=token_dim,
         debug=debug
     )
     
@@ -600,6 +603,7 @@ def main(
         name=f"lr-{lr}-weight_decay-{weight_decay}-nepochs-{num_epochs}",
         save_dir=log_dir,
         offline=debug,
+        sync_tensorboard=True,
     )
 
     trainer = pl.Trainer(
@@ -607,7 +611,7 @@ def main(
         devices=num_gpus,
         deterministic=True,
         precision=32, # Use fp32 for now
-        strategy="ddp",
+        strategy="ddp" if num_gpus>1 else None,
         detect_anomaly=debug,
         log_every_n_steps=1 if debug else 50,
         fast_dev_run=5 if debug else False,
@@ -615,7 +619,8 @@ def main(
         gradient_clip_val=gradient_clip_val, 
         max_epochs=num_epochs, 
         track_grad_norm=2,
-        enable_progress_bar=debug,
+        num_sanity_val_steps=False, # not working for some reasons
+        enable_progress_bar=True,
         logger=False if debug else wandb_logger,
         enable_checkpointing=not debug,
         callbacks=callback_list,
