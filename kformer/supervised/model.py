@@ -2,8 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kformer.supervised.utils import Timer, profile
-from kformer.supervised.utils import fleet_w2i
+from kformer.supervised.utils import Timer, profile, fleet_w2i, SaveOutputHook
 
 
 class TorusConv2d(nn.Module):
@@ -82,7 +81,7 @@ class FusionTransformer(nn.Module):
                 norm_first=True,
                 dropout=0.1,
             ),
-            num_layers=8,
+            num_layers=4,
         )
         self.decoder = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
@@ -93,7 +92,7 @@ class FusionTransformer(nn.Module):
                 norm_first=True,
                 dropout=0.1,
             ),
-            num_layers=4,
+            num_layers=8,
         )
         self.src_ln = nn.LayerNorm(self.token_dim)
         self.tgt_ln = nn.LayerNorm(self.token_dim)
@@ -116,6 +115,12 @@ class FusionTransformer(nn.Module):
         self.plan_token_embedding = nn.Embedding(18, self.token_dim, padding_idx=fleet_w2i["PAD"])
         self.plan_pos_embedding = nn.Embedding(20, self.token_dim)
         self.plan_fc = nn.Linear(self.token_dim, self.token_dim)
+
+        # Hooks for TransformerDecoderLayer
+        self.decoder_outputs = SaveOutputHook()
+        for name, m in self.decoder.named_modules():
+            if isinstance(m, nn.TransformerDecoderLayer):
+                m.register_forward_hook(self.decoder_outputs)
 
     def _get_autoregressive_attn_mask(self, tgt_len, device):
         # Create an upper triangular matrix filled with -inf
@@ -226,6 +231,7 @@ class FusionTransformer(nn.Module):
 
         tgt_attn_mask = self._get_autoregressive_attn_mask(tgt_len=tgt_seq.shape[1], device=tgt_seq.device)
 
+        self.decoder_outputs.clear() # Flush previously saved outputs
         tgt_seq = self.tgt_ln(tgt_seq) # LayerNorm
         tgt_seq = tgt_seq.permute(1, 0, 2)
         out = self.decoder(
@@ -283,15 +289,33 @@ class KoreNet(nn.Module):
             x
         )
 
+        action_logits = []
+        spawn_nr_logits = []
+        launch_nr_logits = []
+        plan_logits = []
+        for idx, layer_output in enumerate(self.fusion_transformer.decoder_outputs.outputs):
+            if idx >= 4: # Consider a couple of last layers
+                batch_first_output = layer_output.permute(1, 0, 2)
+                action_logits.append(self.action_head(batch_first_output[:, 0, :]))
+                spawn_nr_logits.append(self.spawn_nr_head(batch_first_output[:, 0, :]))
+                launch_nr_logits.append(self.launch_nr_head(batch_first_output[:, 0, :]))
+                plan_logits.append(self.plan_head(batch_first_output[:, 1:, :]))
+
         profile(profiler, "fusion_transformer", self.debug)
         
         if self.debug:
             assert fmap_emb.isnan().any().item() == False, "fmap_emb contains nan!"
             assert out.isnan().any().item() == False, "out contains nan!"
 
+        # return dict(
+        #     action_logit=self.action_head(out[:, 0, :]),
+        #     spawn_nr_logit=self.spawn_nr_head(out[:, 0, :]),
+        #     launch_nr_logit=self.launch_nr_head(out[:, 0, :]),
+        #     plan_logit=self.plan_head(out[:, 1:, :])
+        # )
         return dict(
-            action_logit=self.action_head(out[:, 0, :]),
-            spawn_nr_logit=self.spawn_nr_head(out[:, 0, :]),
-            launch_nr_logit=self.launch_nr_head(out[:, 0, :]),
-            plan_logit=self.plan_head(out[:, 1:, :])
+            action_logits=action_logits,
+            spawn_nr_logits=spawn_nr_logits,
+            launch_nr_logits=launch_nr_logits,
+            plan_logits=plan_logits,
         )
