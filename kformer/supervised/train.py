@@ -417,6 +417,7 @@ class LightningModel(pl.LightningModule):
         # plan_loss = (plan_loss * ground_truth_mask).sum() / ground_truth_mask.sum()
 
         loss = action_loss + spawn_nr_loss + launch_nr_loss + plan_loss
+        # loss = loss / 4.0 # Does not matter
 
         self.log("train/loss", loss)
         self.log("train/action_loss", action_loss)
@@ -466,6 +467,7 @@ class LightningModel(pl.LightningModule):
         # plan_loss = (plan_loss * ground_truth_mask).sum() / ground_truth_mask.sum()
 
         loss = action_loss + spawn_nr_loss + launch_nr_loss + plan_loss
+        # loss = loss / 4.0
 
         self.log("val/loss", loss)
         self.log("val/action_loss", action_loss)

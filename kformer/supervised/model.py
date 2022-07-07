@@ -9,8 +9,11 @@ class TorusConv2d(nn.Module):
     def __init__(self, input_dim, output_dim, kernel_size, use_gn):
         super().__init__()
         self.edge_size = (kernel_size[0] // 2, kernel_size[1] // 2)
-        self.conv = nn.Conv2d(input_dim, output_dim, kernel_size=kernel_size, bias=True) # bias=False if we use batchnorm
-        self.gn = nn.GroupNorm(16, 32)
+        self.conv = nn.Conv2d(input_dim, output_dim, kernel_size=kernel_size)
+
+        assert output_dim % 2 == 0, "Out channel must be divisible by 2"
+        self.gn = nn.GroupNorm(output_dim // 2, output_dim)
+        
         self.use_gn = use_gn
 
     def forward(self, x):
@@ -22,12 +25,36 @@ class TorusConv2d(nn.Module):
         return h
 
 
+class TorusSeparableConv2d(nn.Module):
+    def __init__(self, input_dim, output_dim, kernel_size, use_gn):
+        super().__init__()
+        self.edge_size = (kernel_size[0] // 2, kernel_size[1] // 2)
+        
+        # xception
+        self.depth_conv = nn.Conv2d(input_dim, input_dim, kernel_size=kernel_size, groups=input_dim)
+        self.point_conv = nn.Conv2d(input_dim, output_dim, kernel_size=(1, 1))
+        
+        assert output_dim % 2 == 0, "Out channel must be divisible by 2"
+        self.gn = nn.GroupNorm(output_dim // 2, output_dim)
+        
+        self.use_gn = use_gn
+
+    def forward(self, x):
+        h = torch.cat([x[:,:,:,-self.edge_size[1]:], x, x[:,:,:,:self.edge_size[1]]], dim=3)
+        h = torch.cat([h[:,:,-self.edge_size[0]:], h, h[:,:,:self.edge_size[0]]], dim=2)
+        h = self.depth_conv(h)
+        h = self.point_conv(h)
+        if self.use_gn:
+            h = self.gn(h)
+        return h
+
+
 class SpatialEncoder(nn.Module):
     def __init__(self, token_dim, input_ch, filters, layers):
         super().__init__()
         self.token_dim = token_dim
-        self.conv0 = TorusConv2d(input_ch, filters, (3, 3), use_gn=False)
-        self.blocks = nn.ModuleList([TorusConv2d(filters, filters, (3, 3), use_gn=True) for _ in range(layers)])
+        self.conv0 = TorusSeparableConv2d(input_ch, filters, (3, 3), use_gn=False)
+        self.blocks = nn.ModuleList([TorusSeparableConv2d(filters, filters, (3, 3), use_gn=True) for _ in range(layers)])
         self.up_projection = nn.Conv2d(filters, self.token_dim, (1, 1), bias=True)
 
         for m in self.modules():
