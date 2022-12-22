@@ -286,7 +286,7 @@ def CustomCollateFn(batch):
     batch_is_launch = torch.tensor([x["is_launch"] for x in batch], dtype=torch.long).unsqueeze(1)
 
     plans = [x["plan"] for x in batch]
-    max_plan_len = 10 # max([plan.shape[0] for plan in plans])
+    max_plan_len = 12 # max([plan.shape[0] for plan in plans])
     batch_plan = torch.full((batch_size, max_plan_len), shipyard_w2i["PAD"], dtype=torch.long)
     batch_plan_mask = torch.zeros((batch_size, max_plan_len), dtype=torch.long)
     for batch_idx, plan in enumerate(plans):
@@ -355,6 +355,7 @@ class LightningModel(pl.LightningModule):
         num_epochs, 
         num_gpus, 
         num_samples,
+        token_dim,
         debug=False
     ):
         super().__init__()
@@ -368,7 +369,7 @@ class LightningModel(pl.LightningModule):
         self.num_samples = num_samples
         self.debug = debug
 
-        self.net = KoreNet(debug)
+        self.net = KoreNet(token_dim, debug)
 
         self.eps = 1e-7
     
@@ -377,22 +378,46 @@ class LightningModel(pl.LightningModule):
     
     def training_step(self, batch, batch_idx):
         out = self(batch)
+        num_outputs = len(out["action_logits"])
         
-        action_loss = nn.CrossEntropyLoss()(out["action_logit"], batch["action"])
-        
-        spawn_nr_loss = nn.CrossEntropyLoss(reduction="none")(out["spawn_nr_logit"], batch["spawn_nr"]).unsqueeze(1)
-        spawn_nr_loss = (spawn_nr_loss * batch["is_spawn"]).sum() / (batch["is_spawn"].sum() + self.eps)
-
-        launch_nr_loss = nn.MSELoss(reduction="none")(out["launch_nr_logit"], batch["launch_nr"])
-        launch_nr_loss = (launch_nr_loss * batch["is_launch"]).sum() / (batch["is_launch"].sum() + self.eps)
-        
-        pred_plan = out["plan_logit"].permute(0, 2, 1)
+        action_loss = 0
+        spawn_nr_loss = 0
+        launch_nr_loss = 0
+        plan_loss = 0
         ground_truth = batch["plan"][:, 1:] # Shifted one position to the left
         ground_truth_mask = batch["plan_mask"][:, 1:]
-        plan_loss = nn.CrossEntropyLoss(reduction="none")(pred_plan, ground_truth)
-        plan_loss = (plan_loss * ground_truth_mask).sum() / ground_truth_mask.sum()
+
+        for i in range(num_outputs):
+            layer_action_loss = nn.CrossEntropyLoss()(out["action_logits"][i], batch["action"])
+            layer_spawn_nr_loss = nn.CrossEntropyLoss(reduction="none")(out["spawn_nr_logits"][i], batch["spawn_nr"]).unsqueeze(1)
+            layer_spawn_nr_loss = (layer_spawn_nr_loss * batch["is_spawn"]).sum() / (batch["is_spawn"].sum() + self.eps)
+            layer_launch_nr_loss = nn.MSELoss(reduction="none")(out["launch_nr_logits"][i], batch["launch_nr"])
+            layer_launch_nr_loss = (layer_launch_nr_loss * batch["is_launch"]).sum() / (batch["is_launch"].sum() + self.eps)
+            layer_pred_plan = out["plan_logits"][i].permute(0, 2, 1)
+            layer_plan_loss = nn.CrossEntropyLoss(reduction="none")(layer_pred_plan, ground_truth)
+            layer_plan_loss = (layer_plan_loss * ground_truth_mask).sum() / ground_truth_mask.sum()
+
+            action_loss += layer_action_loss
+            spawn_nr_loss += layer_spawn_nr_loss
+            launch_nr_loss += layer_launch_nr_loss
+            plan_loss += layer_plan_loss
+
+        # action_loss = nn.CrossEntropyLoss()(out["action_logit"], batch["action"])
+        
+        # spawn_nr_loss = nn.CrossEntropyLoss(reduction="none")(out["spawn_nr_logit"], batch["spawn_nr"]).unsqueeze(1)
+        # spawn_nr_loss = (spawn_nr_loss * batch["is_spawn"]).sum() / (batch["is_spawn"].sum() + self.eps)
+
+        # launch_nr_loss = nn.MSELoss(reduction="none")(out["launch_nr_logit"], batch["launch_nr"])
+        # launch_nr_loss = (launch_nr_loss * batch["is_launch"]).sum() / (batch["is_launch"].sum() + self.eps)
+        
+        # pred_plan = out["plan_logit"].permute(0, 2, 1)
+        # ground_truth = batch["plan"][:, 1:] # Shifted one position to the left
+        # ground_truth_mask = batch["plan_mask"][:, 1:]
+        # plan_loss = nn.CrossEntropyLoss(reduction="none")(pred_plan, ground_truth)
+        # plan_loss = (plan_loss * ground_truth_mask).sum() / ground_truth_mask.sum()
 
         loss = action_loss + spawn_nr_loss + launch_nr_loss + plan_loss
+        # loss = loss / 4.0 # Does not matter
 
         self.log("train/loss", loss)
         self.log("train/action_loss", action_loss)
@@ -403,34 +428,69 @@ class LightningModel(pl.LightningModule):
     
     def validation_step(self, batch, batch_idx):
         out = self(batch)
+        num_outputs = len(out["action_logits"])
         
-        action_loss = nn.CrossEntropyLoss()(out["action_logit"], batch["action"])
-        
-        spawn_nr_loss = nn.CrossEntropyLoss(reduction="none")(out["spawn_nr_logit"], batch["spawn_nr"]).unsqueeze(1)
-        spawn_nr_loss = (spawn_nr_loss * batch["is_spawn"]).sum() / (batch["is_spawn"].sum() + self.eps)
-
-        launch_nr_loss = nn.MSELoss(reduction="none")(out["launch_nr_logit"], batch["launch_nr"])
-        launch_nr_loss = (launch_nr_loss * batch["is_launch"]).sum() / (batch["is_launch"].sum() + self.eps)
-        
-        pred_plan = out["plan_logit"].permute(0, 2, 1)
+        action_loss = 0
+        spawn_nr_loss = 0
+        launch_nr_loss = 0
+        plan_loss = 0
         ground_truth = batch["plan"][:, 1:] # Shifted one position to the left
         ground_truth_mask = batch["plan_mask"][:, 1:]
-        plan_loss = nn.CrossEntropyLoss(reduction="none")(pred_plan, ground_truth)
-        plan_loss = (plan_loss * ground_truth_mask).sum() / ground_truth_mask.sum()
+
+        for i in range(num_outputs):
+            layer_action_loss = nn.CrossEntropyLoss()(out["action_logits"][i], batch["action"])
+            layer_spawn_nr_loss = nn.CrossEntropyLoss(reduction="none")(out["spawn_nr_logits"][i], batch["spawn_nr"]).unsqueeze(1)
+            layer_spawn_nr_loss = (layer_spawn_nr_loss * batch["is_spawn"]).sum() / (batch["is_spawn"].sum() + self.eps)
+            layer_launch_nr_loss = nn.MSELoss(reduction="none")(out["launch_nr_logits"][i], batch["launch_nr"])
+            layer_launch_nr_loss = (layer_launch_nr_loss * batch["is_launch"]).sum() / (batch["is_launch"].sum() + self.eps)
+            layer_pred_plan = out["plan_logits"][i].permute(0, 2, 1)
+            layer_plan_loss = nn.CrossEntropyLoss(reduction="none")(layer_pred_plan, ground_truth)
+            layer_plan_loss = (layer_plan_loss * ground_truth_mask).sum() / ground_truth_mask.sum()
+
+            action_loss += layer_action_loss
+            spawn_nr_loss += layer_spawn_nr_loss
+            launch_nr_loss += layer_launch_nr_loss
+            plan_loss += layer_plan_loss
+
+        # action_loss = nn.CrossEntropyLoss()(out["action_logit"], batch["action"])
+        
+        # spawn_nr_loss = nn.CrossEntropyLoss(reduction="none")(out["spawn_nr_logit"], batch["spawn_nr"]).unsqueeze(1)
+        # spawn_nr_loss = (spawn_nr_loss * batch["is_spawn"]).sum() / (batch["is_spawn"].sum() + self.eps)
+
+        # launch_nr_loss = nn.MSELoss(reduction="none")(out["launch_nr_logit"], batch["launch_nr"])
+        # launch_nr_loss = (launch_nr_loss * batch["is_launch"]).sum() / (batch["is_launch"].sum() + self.eps)
+        
+        # pred_plan = out["plan_logit"].permute(0, 2, 1)
+        # ground_truth = batch["plan"][:, 1:] # Shifted one position to the left
+        # ground_truth_mask = batch["plan_mask"][:, 1:]
+        # plan_loss = nn.CrossEntropyLoss(reduction="none")(pred_plan, ground_truth)
+        # plan_loss = (plan_loss * ground_truth_mask).sum() / ground_truth_mask.sum()
 
         loss = action_loss + spawn_nr_loss + launch_nr_loss + plan_loss
+        # loss = loss / 4.0
 
         self.log("val/loss", loss)
         self.log("val/action_loss", action_loss)
         self.log("val/spawn_nr_loss", spawn_nr_loss)
         self.log("val/launch_nr_loss", launch_nr_loss)
         self.log("val/plan_loss", plan_loss)
+        # return dict(
+        #     action_logit=out["action_logit"].detach().cpu(),
+        #     action=batch["action"].detach().cpu(),
+        #     spawn_nr_logit=out["spawn_nr_logit"].detach().cpu(),
+        #     spawn_nr=batch["spawn_nr"].detach().cpu(),
+        #     plan_logit=out["plan_logit"].detach().cpu(),
+        #     plan=ground_truth.detach().cpu(),
+        #     plan_mask=ground_truth_mask.detach().cpu(),
+        #     is_launch=batch["is_launch"].detach().cpu(),
+        #     is_spawn=batch["is_spawn"].detach().cpu(),
+        # )
         return dict(
-            action_logit=out["action_logit"].detach().cpu(),
+            action_logit=out["action_logits"][-1].detach().cpu(),
             action=batch["action"].detach().cpu(),
-            spawn_nr_logit=out["spawn_nr_logit"].detach().cpu(),
+            spawn_nr_logit=out["spawn_nr_logits"][-1].detach().cpu(),
             spawn_nr=batch["spawn_nr"].detach().cpu(),
-            plan_logit=out["plan_logit"].detach().cpu(),
+            plan_logit=out["plan_logits"][-1].detach().cpu(),
             plan=ground_truth.detach().cpu(),
             plan_mask=ground_truth_mask.detach().cpu(),
             is_launch=batch["is_launch"].detach().cpu(),
@@ -530,6 +590,7 @@ def main(
     num_gpus=1,
     num_epochs=20,
     batch_size=32,
+    token_dim=128,
     debug=True,
     train_csv_dir=os.path.join(base_path, "kore/train.csv"),
     replay_dir=os.path.join(base_path, "kore/replays.pkl"),
@@ -575,6 +636,7 @@ def main(
         num_gpus=num_gpus,
         num_epochs=num_epochs,
         num_samples=len(train_ds),
+        token_dim=token_dim,
         debug=debug
     )
     
@@ -594,20 +656,22 @@ def main(
     )
     callback_list = [checkpoint_callback] if not debug else []
 
-    wandb_logger = WandbLogger(
-        project="kore2022",
-        entity="kaggle-kvu",
-        name=f"lr-{lr}-weight_decay-{weight_decay}-nepochs-{num_epochs}",
-        save_dir=log_dir,
-        offline=debug,
-    )
+    if not debug:
+        wandb_logger = WandbLogger(
+            project="kore2022",
+            entity="kaggle-kvu",
+            name=f"lr-{lr}-weight_decay-{weight_decay}-nepochs-{num_epochs}",
+            save_dir=log_dir,
+            offline=debug,
+            sync_tensorboard=True,
+        )
 
     trainer = pl.Trainer(
         accelerator="gpu",
         devices=num_gpus,
         deterministic=True,
         precision=32, # Use fp32 for now
-        strategy="ddp",
+        strategy="ddp" if num_gpus>1 else None,
         detect_anomaly=debug,
         log_every_n_steps=1 if debug else 50,
         fast_dev_run=5 if debug else False,
@@ -615,7 +679,8 @@ def main(
         gradient_clip_val=gradient_clip_val, 
         max_epochs=num_epochs, 
         track_grad_norm=2,
-        enable_progress_bar=debug,
+        num_sanity_val_steps=False, # not working for some reasons
+        enable_progress_bar=False,
         logger=False if debug else wandb_logger,
         enable_checkpointing=not debug,
         callbacks=callback_list,

@@ -2,16 +2,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kformer.supervised.utils import Timer, profile
-from kformer.supervised.utils import fleet_w2i
+from kformer.supervised.utils import Timer, profile, fleet_w2i, SaveOutputHook
 
 
 class TorusConv2d(nn.Module):
     def __init__(self, input_dim, output_dim, kernel_size, use_gn):
         super().__init__()
         self.edge_size = (kernel_size[0] // 2, kernel_size[1] // 2)
-        self.conv = nn.Conv2d(input_dim, output_dim, kernel_size=kernel_size, bias=False)
-        self.gn = nn.GroupNorm(16, 32)
+        self.conv = nn.Conv2d(input_dim, output_dim, kernel_size=kernel_size)
+
+        assert output_dim % 2 == 0, "Out channel must be divisible by 2"
+        self.gn = nn.GroupNorm(output_dim // 2, output_dim)
+        
         self.use_gn = use_gn
 
     def forward(self, x):
@@ -23,12 +25,36 @@ class TorusConv2d(nn.Module):
         return h
 
 
+class TorusSeparableConv2d(nn.Module):
+    def __init__(self, input_dim, output_dim, kernel_size, use_gn):
+        super().__init__()
+        self.edge_size = (kernel_size[0] // 2, kernel_size[1] // 2)
+        
+        # xception
+        self.depth_conv = nn.Conv2d(input_dim, input_dim, kernel_size=kernel_size, groups=input_dim)
+        self.point_conv = nn.Conv2d(input_dim, output_dim, kernel_size=(1, 1))
+        
+        assert output_dim % 2 == 0, "Out channel must be divisible by 2"
+        self.gn = nn.GroupNorm(output_dim // 2, output_dim)
+        
+        self.use_gn = use_gn
+
+    def forward(self, x):
+        h = torch.cat([x[:,:,:,-self.edge_size[1]:], x, x[:,:,:,:self.edge_size[1]]], dim=3)
+        h = torch.cat([h[:,:,-self.edge_size[0]:], h, h[:,:,:self.edge_size[0]]], dim=2)
+        h = self.depth_conv(h)
+        h = self.point_conv(h)
+        if self.use_gn:
+            h = self.gn(h)
+        return h
+
+
 class SpatialEncoder(nn.Module):
     def __init__(self, token_dim, input_ch, filters, layers):
         super().__init__()
         self.token_dim = token_dim
-        self.conv0 = TorusConv2d(input_ch, filters, (3, 3), use_gn=False)
-        self.blocks = nn.ModuleList([TorusConv2d(filters, filters, (3, 3), use_gn=True) for _ in range(layers)])
+        self.conv0 = TorusSeparableConv2d(input_ch, filters, (3, 3), use_gn=False)
+        self.blocks = nn.ModuleList([TorusSeparableConv2d(filters, filters, (3, 3), use_gn=True) for _ in range(layers)])
         self.up_projection = nn.Conv2d(filters, self.token_dim, (1, 1), bias=True)
 
         for m in self.modules():
@@ -53,7 +79,6 @@ class ScalarEncoder(nn.Module):
         super().__init__()
         self.fc = nn.Sequential(
             nn.Linear(input_dim, 256),
-            # nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Linear(256, output_dim),
         )
@@ -81,8 +106,9 @@ class FusionTransformer(nn.Module):
                 dim_feedforward=512,
                 activation="gelu",
                 norm_first=True,
+                dropout=0.1,
             ),
-            num_layers=8,
+            num_layers=4,
         )
         self.decoder = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
@@ -91,13 +117,14 @@ class FusionTransformer(nn.Module):
                 dim_feedforward=512,
                 activation="gelu",
                 norm_first=True,
+                dropout=0.1,
             ),
-            num_layers=4,
+            num_layers=8,
         )
         self.src_ln = nn.LayerNorm(self.token_dim)
         self.tgt_ln = nn.LayerNorm(self.token_dim)
 
-        self.max_tgt_plan_len = 9
+        self.max_tgt_plan_len = 11
         self.sep_token = nn.Parameter(nn.init.normal_(torch.empty(1, self.token_dim)))
         self.tgt_cls_token = nn.Parameter(nn.init.normal_(torch.empty(1, self.token_dim)))
         
@@ -115,6 +142,12 @@ class FusionTransformer(nn.Module):
         self.plan_token_embedding = nn.Embedding(18, self.token_dim, padding_idx=fleet_w2i["PAD"])
         self.plan_pos_embedding = nn.Embedding(20, self.token_dim)
         self.plan_fc = nn.Linear(self.token_dim, self.token_dim)
+
+        # Hooks for TransformerDecoderLayer
+        self.decoder_outputs = SaveOutputHook()
+        for name, m in self.decoder.named_modules():
+            if isinstance(m, nn.TransformerDecoderLayer):
+                m.register_forward_hook(self.decoder_outputs)
 
     def _get_autoregressive_attn_mask(self, tgt_len, device):
         # Create an upper triangular matrix filled with -inf
@@ -221,10 +254,11 @@ class FusionTransformer(nn.Module):
         
         # Make tgt_seq
         tgt_seq = torch.cat([cls_token, plan_emb], dim=1)
-        assert tgt_seq.shape[1] == 10, "The tgt_seq's length is incorrect!"
+        # assert tgt_seq.shape[1] == 10, "The tgt_seq's length is incorrect!"
 
         tgt_attn_mask = self._get_autoregressive_attn_mask(tgt_len=tgt_seq.shape[1], device=tgt_seq.device)
 
+        self.decoder_outputs.clear() # Flush previously saved outputs
         tgt_seq = self.tgt_ln(tgt_seq) # LayerNorm
         tgt_seq = tgt_seq.permute(1, 0, 2)
         out = self.decoder(
@@ -282,15 +316,33 @@ class KoreNet(nn.Module):
             x
         )
 
+        action_logits = []
+        spawn_nr_logits = []
+        launch_nr_logits = []
+        plan_logits = []
+        for idx, layer_output in enumerate(self.fusion_transformer.decoder_outputs.outputs):
+            if idx >= 4: # Consider a couple of last layers
+                batch_first_output = layer_output.permute(1, 0, 2)
+                action_logits.append(self.action_head(batch_first_output[:, 0, :]))
+                spawn_nr_logits.append(self.spawn_nr_head(batch_first_output[:, 0, :]))
+                launch_nr_logits.append(self.launch_nr_head(batch_first_output[:, 0, :]))
+                plan_logits.append(self.plan_head(batch_first_output[:, 1:, :]))
+
         profile(profiler, "fusion_transformer", self.debug)
         
         if self.debug:
             assert fmap_emb.isnan().any().item() == False, "fmap_emb contains nan!"
             assert out.isnan().any().item() == False, "out contains nan!"
 
+        # return dict(
+        #     action_logit=self.action_head(out[:, 0, :]),
+        #     spawn_nr_logit=self.spawn_nr_head(out[:, 0, :]),
+        #     launch_nr_logit=self.launch_nr_head(out[:, 0, :]),
+        #     plan_logit=self.plan_head(out[:, 1:, :])
+        # )
         return dict(
-            action_logit=self.action_head(out[:, 0, :]),
-            spawn_nr_logit=self.spawn_nr_head(out[:, 0, :]),
-            launch_nr_logit=self.launch_nr_head(out[:, 0, :]),
-            plan_logit=self.plan_head(out[:, 1:, :])
+            action_logits=action_logits,
+            spawn_nr_logits=spawn_nr_logits,
+            launch_nr_logits=launch_nr_logits,
+            plan_logits=plan_logits,
         )
