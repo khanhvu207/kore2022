@@ -59,3 +59,9 @@ style="display: block; margin: 0 auto"
 
 I tracked all the training iterations on the W&B platform. Click [here](https://wandb.ai/kaggle-kvu/kore2022?workspace=user-kvu207) to see the results.
 
+## To-do list
+- [x] [#1 Reduce overheads in CustomCollateFn](https://github.com/khanhvu207/kore2022/issues/1)
+- [x] [#2 Refine the training pipeline](https://github.com/khanhvu207/kore2022/issues/2)
+- [x] [#10 Make the decoder part an autoregressive model](https://github.com/khanhvu207/kore2022/issues/10)
+- [x] [#8 Redo the modeling approach and training pipeline](https://github.com/khanhvu207/kore2022/issues/8)
+- [x] [#6 (BUG) Dead network at the start of the training](https://github.com/khanhvu207/kore2022/issues/6)
