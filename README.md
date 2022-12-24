@@ -1,4 +1,4 @@
-# Kore 2022 - Kaggle Competition
+# Kore 2022 🌌 - Kaggle Competition
 
 [Competition link](https://www.kaggle.com/c/kore-2022)
 
@@ -22,7 +22,7 @@ I designed a multi-modal Transformers architecture that essentially "translates"
 
 - **Spatial features.** I stacked multiple 2D tensors which capture ships' locations, ships' cargo capacity and etc. into a 3D tensor of 18 channels, then feed it into a 12-layer ResNet with a [GroupNorm](https://arxiv.org/abs/1803.08494) layer in between the residual blocks.
 - **Scalar features:** Scalar inputs are concatenated into a single vector and fed into an MLP.
-- **Ship plan features.** First, each character is mapped to a learnable vector embedding whose dimension exactly half of the Transformers embedding's dimension (e.g. if the Transformer's embeddings are 512-dim vectors then a character embedding is a 256-dim vector). Then, I concatenated a positional embedding of the same dimensional with the learnable character embedding, sum up these concatenated vectors into a single vector representation. This approach is also known as Bag-of-Words.
+- **Ship plan features.** First, each character is mapped to a learnable vector embedding whose dimension exactly half of the Transformers embedding's dimension (e.g. if the Transformer's embeddings are 512-dim vectors then a character embedding is a 256-dim vector). Then, I concatenated a positional embedding of the same dimensional with the learnable character embedding, sum up these concatenated vectors into a single vector representation. This approach is also known as [Bag-of-Words](https://en.wikipedia.org/wiki/Bag-of-words_model). Of course, we can extract the vector representations here with another Transformers model, but I saw that it is unnecessary and computationally expensive.
 
 <img
 src="asset/kore.png"
@@ -32,7 +32,7 @@ height="550"
 style="display: block; margin: 0 auto"
 />
 
-The output sequence is decoded by the Transformers decoder in an autoregressive manner, one character at a time just like machine translation! The `[CLS]` token was inputed into an MLP to predict the action type. Overall, my approach closely resembles the [Pixel-Bert](https://arxiv.org/abs/2004.00849) architecture for image-text alignment tasks.
+The output sequence is decoded by the Transformers decoder in an autoregressive manner, one character at a time just like machine translation! The `[CLS]` token was inputed into an MLP to predict the action type. Overall, my approach closely resembles the [Pixel-BERT](https://arxiv.org/abs/2004.00849) architecture for image-text alignment tasks.
 
 ### Training set-up
 
